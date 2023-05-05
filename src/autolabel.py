@@ -36,7 +36,7 @@ class AutoLabel:
     def findAllImageInFolder(self):
         imagePaths = []
         
-        print(f"looking for image files in {self.processingFolder}")
+        print(f"looking for files in {self.processingFolder}")
         for roots,dirs,files in os.walk(self.processingFolder):
             print(f"found {len(files)} files in {self.processingFolder}")
             for file in files:
