@@ -4,11 +4,11 @@ simple autolabeling tool , uses yolov7x model to auto label images in labelme fo
 ## usage
 
 ### install requirements
-<br>
+
 `pip install -r requirements.txt`
-<br>
+
 ### label
-<br>
+
 `cd src`
 <br>
 `python3 main.py --source path/to/image/folder`
