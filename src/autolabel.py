@@ -67,5 +67,3 @@ class AutoLabel:
         
 
 
-# test = AutoLabel("test")
-# test.Label()
