@@ -10,23 +10,23 @@ import requests
 import torch
 
 
-def gsutil_getsize(url=''):
+def gsutil_getsize(url=""):
     # gs://bucket/file size https://cloud.google.com/storage/docs/gsutil/commands/du
-    s = subprocess.check_output(f'gsutil du {url}', shell=True).decode('utf-8')
-    return eval(s.split(' ')[0]) if len(s) else 0  # bytes
+    s = subprocess.check_output(f"gsutil du {url}", shell=True).decode("utf-8")
+    return eval(s.split(" ")[0]) if len(s) else 0  # bytes
 
 
-def attempt_download(file, repo='WongKinYiu/yolov7'):
+def attempt_download(file, repo="WongKinYiu/yolov7"):
     # Attempt file download if does not exist
-    file = Path(str(file).strip().replace("'", '').lower())
-    
+    file = Path(str(file).strip().replace("'", "").lower())
+
     # if not file.exists():
     #     try:
     #         response = requests.get(f'https://api.github.com/repos/{repo}/releases/latest').json()  # github api
     #         assets = [x['name'] for x in response['assets']]  # release assets
     #         tag = response['tag_name']  # i.e. 'v1.0'
     #     except:  # fallback plan
-    #         assets = ['yolov7.pt', 'yolov7-tiny.pt', 'yolov7x.pt', 'yolov7-d6.pt', 'yolov7-e6.pt', 
+    #         assets = ['yolov7.pt', 'yolov7-tiny.pt', 'yolov7x.pt', 'yolov7-d6.pt', 'yolov7-e6.pt',
     #                   'yolov7-e6e.pt', 'yolov7-w6.pt']
     #         tag = subprocess.check_output('git tag', shell=True).decode().split()[-1]
 
@@ -53,19 +53,24 @@ def attempt_download(file, repo='WongKinYiu/yolov7'):
     #             return
 
 
-def gdrive_download(id='', file='tmp.zip'):
+def gdrive_download(id="", file="tmp.zip"):
     # Downloads a file from Google Drive. from yolov7.utils.google_utils import *; gdrive_download()
     t = time.time()
     file = Path(file)
-    cookie = Path('cookie')  # gdrive cookie
-    print(f'Downloading https://drive.google.com/uc?export=download&id={id} as {file}... ', end='')
+    cookie = Path("cookie")  # gdrive cookie
+    print(
+        f"Downloading https://drive.google.com/uc?export=download&id={id} as {file}... ",
+        end="",
+    )
     file.unlink(missing_ok=True)  # remove existing file
     cookie.unlink(missing_ok=True)  # remove existing cookie
 
     # Attempt file download
     out = "NUL" if platform.system() == "Windows" else "/dev/null"
-    os.system(f'curl -c ./cookie -s -L "drive.google.com/uc?export=download&id={id}" > {out}')
-    if os.path.exists('cookie'):  # large file
+    os.system(
+        f'curl -c ./cookie -s -L "drive.google.com/uc?export=download&id={id}" > {out}'
+    )
+    if os.path.exists("cookie"):  # large file
         s = f'curl -Lb ./cookie "drive.google.com/uc?export=download&confirm={get_token()}&id={id}" -o {file}'
     else:  # small file
         s = f'curl -s -L -o {file} "drive.google.com/uc?export=download&id={id}"'
@@ -75,16 +80,16 @@ def gdrive_download(id='', file='tmp.zip'):
     # Error check
     if r != 0:
         file.unlink(missing_ok=True)  # remove partial
-        print('Download error ')  # raise Exception('Download error')
+        print("Download error ")  # raise Exception('Download error')
         return r
 
     # Unzip if archive
-    if file.suffix == '.zip':
-        print('unzipping... ', end='')
-        os.system(f'unzip -q {file}')  # unzip
+    if file.suffix == ".zip":
+        print("unzipping... ", end="")
+        os.system(f"unzip -q {file}")  # unzip
         file.unlink()  # remove zip to free space
 
-    print(f'Done ({time.time() - t:.1f}s)')
+    print(f"Done ({time.time() - t:.1f}s)")
     return r
 
 
@@ -94,6 +99,7 @@ def get_token(cookie="./cookie"):
             if "download" in line:
                 return line.split()[-1]
     return ""
+
 
 # def upload_blob(bucket_name, source_file_name, destination_blob_name):
 #     # Uploads a file to a bucket
