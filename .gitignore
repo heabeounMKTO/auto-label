@@ -163,8 +163,8 @@ cython_debug/
 
 
 #goofy ahh models
-src/detect-models/*.pt
-src/test/*.json
-src/test/*.jpeg
-src/test/*.png
-src/test/*.jpg
+detect-models/*.pt
+test/*.json
+test/*.jpeg
+test/*.png
+test/*.jpg
