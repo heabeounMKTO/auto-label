@@ -36,7 +36,7 @@ class imageDetect:
         self.device = device
         self.conf = conf
 
-    def preProcess(self, im0s, target_size=640):
+    def preProcess(self, im0s, target_size=128):
         self.base64image = self.convertImg2b64(im0s)
         self.filename = os.path.basename(im0s)
         im0s = cv2.imread(im0s)
@@ -53,7 +53,7 @@ class imageDetect:
         return imgstring
 
     def detect(
-        self, half=False, imgsz=(640, 640), iou_thres=0.7, max_det=100, classes=None
+        self, half=False, imgsz=(320,320), iou_thres=0.7, max_det=100, classes=None
     ):
         # pt_detections = []
         source = self.source
@@ -97,7 +97,7 @@ class imageDetect:
                     points = {
                         "label": names[int(cls)],
                         "points": pointcombined,
-                        "group_id": "null",
+                        "group_id": f"{conf}",
                         "shape_type": "rectangle",
                         "flags": {},
                     }
