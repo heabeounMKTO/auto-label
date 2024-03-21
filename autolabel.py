@@ -16,7 +16,6 @@ from rich.table import Table
 config = configparser.ConfigParser()
 config.read("auto-labelcfg.ini")
 
-
 MODEL_PATH = os.path.join("detect-models", config["MODEL"]["MODEL_NAME"])
 CUDA_DEVICE = select_device(str(config["DEVICE_SETTINGS"]["CUDA_DEVICE"]))
 CONFIDENCE_THRESH = float(config["INFERENCE_CONFIG"]["CONFIDENCE"])

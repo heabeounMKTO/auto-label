@@ -31,15 +31,10 @@ def make_request(image_path: str):
         # print(_resp)
         # print(len(_resp['detections'])) 
         if len(_resp['detections']) != 0:
-            shutil.move(image_path, os.path.join(BACK_DIR, fname))
+            shutil.move(image_path, os.path.join(FRONT_DIR, fname))
     except Exception as e:
         print(e)
         pass
-
-
-
-
-
 
 
 if __name__ == "__main__":
@@ -57,4 +52,5 @@ if __name__ == "__main__":
         os.makedirs(FRONT_DIR)
     
     all_images = [os.path.join(opt.folder, x) for x in os.listdir(opt.folder)]
+    # print(all_images)
     [make_request(x) for x in tqdm(all_images)]
