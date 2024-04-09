@@ -1,15 +1,16 @@
-# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
-"""
-Common modules
-"""
-
+import ast
+import contextlib
 import json
 import math
 import platform
 import warnings
+import zipfile
 from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
+from urllib.parse import urlparse
+
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -17,114 +18,172 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+from IPython.display import display
 from PIL import Image
 from torch.cuda import amp
 
+from utils import TryExcept
 from utils.dataloaders import exif_transpose, letterbox
 from utils.general import (
     LOGGER,
     ROOT,
+    Profile,
     check_requirements,
     check_suffix,
     check_version,
     colorstr,
     increment_path,
+    is_notebook,
     make_divisible,
     non_max_suppression,
-    scale_coords,
+    scale_boxes,
     xywh2xyxy,
     xyxy2xywh,
     yaml_load,
 )
 from utils.plots import Annotator, colors, save_one_box
-from utils.torch_utils import copy_attr, smart_inference_mode, time_sync
+from utils.torch_utils import copy_attr, smart_inference_mode
 
 
-def autopad(k, p=None):  # kernel, padding
-    # Pad to 'same'
+def autopad(k, p=None, d=1):  # kernel, padding, dilation
+    # Pad to 'same' shape outputs
+    if d > 1:
+        k = (
+            d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
+        )  # actual kernel-size
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
-class RepConv(nn.Module):
-    # Represented convolution
-    # https://arxiv.org/abs/2101.03697
 
-    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True, deploy=False):
-        super(RepConv, self).__init__()
+class Conv(nn.Module):
+    # Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)
+    default_act = nn.SiLU()  # default activation
 
-        self.deploy = deploy
-        self.groups = g
-        self.in_channels = c1
-        self.out_channels = c2
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False
+        )
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = (
+            self.default_act
+            if act is True
+            else act
+            if isinstance(act, nn.Module)
+            else nn.Identity()
+        )
 
-        assert k == 3
-        assert autopad(k, p) == 1
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
 
-        padding_11 = autopad(k, p) - k // 2
+    def forward_fuse(self, x):
+        return self.act(self.conv(x))
 
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
-        if deploy:
-            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
+class AConv(nn.Module):
+    def __init__(self, c1, c2):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        self.cv1 = Conv(c1, c2, 3, 2, 1)
 
-        else:
-            self.rbr_identity = (nn.BatchNorm2d(num_features=c1) if c2 == c1 and s == 1 else None)
+    def forward(self, x):
+        x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+        return self.cv1(x)
 
-            self.rbr_dense = nn.Sequential(
-                nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
-                nn.BatchNorm2d(num_features=c2),
-            )
 
-            self.rbr_1x1 = nn.Sequential(
-                nn.Conv2d( c1, c2, 1, s, padding_11, groups=g, bias=False),
-                nn.BatchNorm2d(num_features=c2),
-            )
+class ADown(nn.Module):
+    def __init__(self, c1, c2):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = Conv(c1 // 2, self.c, 3, 2, 1)
+        self.cv2 = Conv(c1 // 2, self.c, 1, 1, 0)
 
-    def forward(self, inputs):
-        if hasattr(self, "rbr_reparam"):
-            return self.act(self.rbr_reparam(inputs))
+    def forward(self, x):
+        x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+        x1, x2 = x.chunk(2, 1)
+        x1 = self.cv1(x1)
+        x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
+        x2 = self.cv2(x2)
+        return torch.cat((x1, x2), 1)
 
-        if self.rbr_identity is None:
-            id_out = 0
-        else:
-            id_out = self.rbr_identity(inputs)
 
-        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
-    
+class RepConvN(nn.Module):
+    """RepConv is a basic rep-style block, including training and deploy status
+    This code is based on https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
+    """
+
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(
+        self, c1, c2, k=3, s=1, p=1, g=1, d=1, act=True, bn=False, deploy=False
+    ):
+        super().__init__()
+        assert k == 3 and p == 1
+        self.g = g
+        self.c1 = c1
+        self.c2 = c2
+        self.act = (
+            self.default_act
+            if act is True
+            else act
+            if isinstance(act, nn.Module)
+            else nn.Identity()
+        )
+
+        self.bn = None
+        self.conv1 = Conv(c1, c2, k, s, p=p, g=g, act=False)
+        self.conv2 = Conv(c1, c2, 1, s, p=(p - k // 2), g=g, act=False)
+
+    def forward_fuse(self, x):
+        """Forward process"""
+        return self.act(self.conv(x))
+
+    def forward(self, x):
+        """Forward process"""
+        id_out = 0 if self.bn is None else self.bn(x)
+        return self.act(self.conv1(x) + self.conv2(x) + id_out)
+
     def get_equivalent_kernel_bias(self):
-        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
-        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
-        kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+        kernel3x3, bias3x3 = self._fuse_bn_tensor(self.conv1)
+        kernel1x1, bias1x1 = self._fuse_bn_tensor(self.conv2)
+        kernelid, biasid = self._fuse_bn_tensor(self.bn)
         return (
             kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid,
             bias3x3 + bias1x1 + biasid,
         )
 
+    def _avg_to_3x3_tensor(self, avgp):
+        channels = self.c1
+        groups = self.g
+        kernel_size = avgp.kernel_size
+        input_dim = channels // groups
+        k = torch.zeros((channels, input_dim, kernel_size, kernel_size))
+        k[np.arange(channels), np.tile(np.arange(input_dim), groups), :, :] = (
+            1.0 / kernel_size ** 2
+        )
+        return k
+
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
             return 0
         else:
-            return nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
     def _fuse_bn_tensor(self, branch):
         if branch is None:
             return 0, 0
-        if isinstance(branch, nn.Sequential):
-            kernel = branch[0].weight
-            running_mean = branch[1].running_mean
-            running_var = branch[1].running_var
-            gamma = branch[1].weight
-            beta = branch[1].bias
-            eps = branch[1].eps
-        else:
-            assert isinstance(branch, nn.BatchNorm2d)
+        if isinstance(branch, Conv):
+            kernel = branch.conv.weight
+            running_mean = branch.bn.running_mean
+            running_var = branch.bn.running_var
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn.eps
+        elif isinstance(branch, nn.BatchNorm2d):
             if not hasattr(self, "id_tensor"):
-                input_dim = self.in_channels // self.groups
-                kernel_value = np.zeros(
-                    (self.in_channels, input_dim, 3, 3), dtype=np.float32
-                )
-                for i in range(self.in_channels):
+                input_dim = self.c1 // self.g
+                kernel_value = np.zeros((self.c1, input_dim, 3, 3), dtype=np.float32)
+                for i in range(self.c1):
                     kernel_value[i, i % input_dim, 1, 1] = 1
                 self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device)
             kernel = self.id_tensor
@@ -137,130 +196,35 @@ class RepConv(nn.Module):
         t = (gamma / std).reshape(-1, 1, 1, 1)
         return kernel * t, beta - running_mean * gamma / std
 
-    def repvgg_convert(self):
-        kernel, bias = self.get_equivalent_kernel_bias()
-        return (
-            kernel.detach().cpu().numpy(),
-            bias.detach().cpu().numpy(),
-        )
-
-    def fuse_conv_bn(self, conv, bn):
-
-        std = (bn.running_var + bn.eps).sqrt()
-        bias = bn.bias - bn.running_mean * bn.weight / std
-
-        t = (bn.weight / std).reshape(-1, 1, 1, 1)
-        weights = conv.weight * t
-
-        bn = nn.Identity()
-        conv = nn.Conv2d(in_channels = conv.in_channels,
-                              out_channels = conv.out_channels,
-                              kernel_size = conv.kernel_size,
-                              stride=conv.stride,
-                              padding = conv.padding,
-                              dilation = conv.dilation,
-                              groups = conv.groups,
-                              bias = True,
-                              padding_mode = conv.padding_mode)
-
-        conv.weight = torch.nn.Parameter(weights)
-        conv.bias = torch.nn.Parameter(bias)
-        return conv
-
-    def fuse_repvgg_block(self):    
-        if self.deploy:
+    def fuse_convs(self):
+        if hasattr(self, "conv"):
             return
-        print(f"RepConv.fuse_repvgg_block")
-                
-        self.rbr_dense = self.fuse_conv_bn(self.rbr_dense[0], self.rbr_dense[1])
-        
-        self.rbr_1x1 = self.fuse_conv_bn(self.rbr_1x1[0], self.rbr_1x1[1])
-        rbr_1x1_bias = self.rbr_1x1.bias
-        weight_1x1_expanded = torch.nn.functional.pad(self.rbr_1x1.weight, [1, 1, 1, 1])
-        
-        # Fuse self.rbr_identity
-        if (isinstance(self.rbr_identity, nn.BatchNorm2d) or isinstance(self.rbr_identity, nn.modules.batchnorm.SyncBatchNorm)):
-            # print(f"fuse: rbr_identity == BatchNorm2d or SyncBatchNorm")
-            identity_conv_1x1 = nn.Conv2d(
-                    in_channels=self.in_channels,
-                    out_channels=self.out_channels,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    groups=self.groups, 
-                    bias=False)
-            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.to(self.rbr_1x1.weight.data.device)
-            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.squeeze().squeeze()
-            # print(f" identity_conv_1x1.weight = {identity_conv_1x1.weight.shape}")
-            identity_conv_1x1.weight.data.fill_(0.0)
-            identity_conv_1x1.weight.data.fill_diagonal_(1.0)
-            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.unsqueeze(2).unsqueeze(3)
-            # print(f" identity_conv_1x1.weight = {identity_conv_1x1.weight.shape}")
-
-            identity_conv_1x1 = self.fuse_conv_bn(identity_conv_1x1, self.rbr_identity)
-            bias_identity_expanded = identity_conv_1x1.bias
-            weight_identity_expanded = torch.nn.functional.pad(identity_conv_1x1.weight, [1, 1, 1, 1])            
-        else:
-            # print(f"fuse: rbr_identity != BatchNorm2d, rbr_identity = {self.rbr_identity}")
-            bias_identity_expanded = torch.nn.Parameter( torch.zeros_like(rbr_1x1_bias) )
-            weight_identity_expanded = torch.nn.Parameter( torch.zeros_like(weight_1x1_expanded) )            
-        
-
-        #print(f"self.rbr_1x1.weight = {self.rbr_1x1.weight.shape}, ")
-        #print(f"weight_1x1_expanded = {weight_1x1_expanded.shape}, ")
-        #print(f"self.rbr_dense.weight = {self.rbr_dense.weight.shape}, ")
-
-        self.rbr_dense.weight = torch.nn.Parameter(self.rbr_dense.weight + weight_1x1_expanded + weight_identity_expanded)
-        self.rbr_dense.bias = torch.nn.Parameter(self.rbr_dense.bias + rbr_1x1_bias + bias_identity_expanded)
-                
-        self.rbr_reparam = self.rbr_dense
-        self.deploy = True
-
-        if self.rbr_identity is not None:
-            del self.rbr_identity
-            self.rbr_identity = None
-
-        if self.rbr_1x1 is not None:
-            del self.rbr_1x1
-            self.rbr_1x1 = None
-
-        if self.rbr_dense is not None:
-            del self.rbr_dense
-            self.rbr_dense = None
-class ImplicitA(nn.Module):
-    def __init__(self, channel):
-        super(ImplicitA, self).__init__()
-        self.channel = channel
-        self.implicit = nn.Parameter(torch.zeros(1, channel, 1, 1))
-        nn.init.normal_(self.implicit, std=0.02)
-
-    def forward(self, x):
-        return self.implicit + x
-
-
-class ImplicitM(nn.Module):
-    def __init__(self, channel):
-        super(ImplicitM, self).__init__()
-        self.channel = channel
-        self.implicit = nn.Parameter(torch.ones(1, channel, 1, 1))
-        nn.init.normal_(self.implicit, mean=1.0, std=0.02)
-
-    def forward(self, x):
-        return self.implicit * x
-
-
-class MP(nn.Module):
-    # Spatial pyramid pooling layer used in YOLOv3-SPP
-    def __init__(self, k=2):
-        super(MP, self).__init__()
-        self.m = nn.MaxPool2d(kernel_size=k, stride=k)
-
-    def forward(self, x):
-        return self.m(x)
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.conv = nn.Conv2d(
+            in_channels=self.conv1.conv.in_channels,
+            out_channels=self.conv1.conv.out_channels,
+            kernel_size=self.conv1.conv.kernel_size,
+            stride=self.conv1.conv.stride,
+            padding=self.conv1.conv.padding,
+            dilation=self.conv1.conv.dilation,
+            groups=self.conv1.conv.groups,
+            bias=True,
+        ).requires_grad_(False)
+        self.conv.weight.data = kernel
+        self.conv.bias.data = bias
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__("conv1")
+        self.__delattr__("conv2")
+        if hasattr(self, "nm"):
+            self.__delattr__("nm")
+        if hasattr(self, "bn"):
+            self.__delattr__("bn")
+        if hasattr(self, "id_tensor"):
+            self.__delattr__("id_tensor")
 
 
 class SP(nn.Module):
-    # Spatial pyramid pooling layer used in YOLOv3-SPP
     def __init__(self, k=3, s=1):
         super(SP, self).__init__()
         self.m = nn.MaxPool2d(kernel_size=k, stride=s, padding=k // 2)
@@ -269,110 +233,184 @@ class SP(nn.Module):
         return self.m(x)
 
 
-class ReOrg(nn.Module):
-    def __init__(self):
-        super(ReOrg, self).__init__()
+class MP(nn.Module):
+    # Max pooling
+    def __init__(self, k=2):
+        super(MP, self).__init__()
+        self.m = nn.MaxPool2d(kernel_size=k, stride=k)
 
-    def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
-        return torch.cat(
-            [
-                x[..., ::2, ::2],
-                x[..., 1::2, ::2],
-                x[..., ::2, 1::2],
-                x[..., 1::2, 1::2],
-            ],
-            1,
-        )
+    def forward(self, x):
+        return self.m(x)
 
 
-class Conv(nn.Module):
-    # Standard convolution
-    def __init__(
-        self, c1, c2, k=1, s=1, p=None, g=1, act=True
-    ):  # ch_in, ch_out, kernel, stride, padding, groups
+class ConvTranspose(nn.Module):
+    # Convolution transpose 2d layer
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=2, s=2, p=0, bn=True, act=True):
         super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
+        self.conv_transpose = nn.ConvTranspose2d(c1, c2, k, s, p, bias=not bn)
+        self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
         self.act = (
-            nn.SiLU()
+            self.default_act
             if act is True
-            else (act if isinstance(act, nn.Module) else nn.Identity())
+            else act
+            if isinstance(act, nn.Module)
+            else nn.Identity()
         )
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-    def forward_fuse(self, x):
-        return self.act(self.conv(x))
+        return self.act(self.bn(self.conv_transpose(x)))
 
 
 class DWConv(Conv):
-    # Depth-wise convolution class
+    # Depth-wise convolution
     def __init__(
-        self, c1, c2, k=1, s=1, act=True
-    ):  # ch_in, ch_out, kernel, stride, padding, groups
-        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), act=act)
+        self, c1, c2, k=1, s=1, d=1, act=True
+    ):  # ch_in, ch_out, kernel, stride, dilation, activation
+        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):
-    # Depth-wise transpose convolution class
+    # Depth-wise transpose convolution
     def __init__(
         self, c1, c2, k=1, s=1, p1=0, p2=0
     ):  # ch_in, ch_out, kernel, stride, padding, padding_out
         super().__init__(c1, c2, k, s, p1, p2, groups=math.gcd(c1, c2))
 
 
-class TransformerLayer(nn.Module):
-    # Transformer layer https://arxiv.org/abs/2010.11929 (LayerNorm layers removed for better performance)
-    def __init__(self, c, num_heads):
+class DFL(nn.Module):
+    # DFL module
+    def __init__(self, c1=17):
         super().__init__()
-        self.q = nn.Linear(c, c, bias=False)
-        self.k = nn.Linear(c, c, bias=False)
-        self.v = nn.Linear(c, c, bias=False)
-        self.ma = nn.MultiheadAttention(embed_dim=c, num_heads=num_heads)
-        self.fc1 = nn.Linear(c, c, bias=False)
-        self.fc2 = nn.Linear(c, c, bias=False)
+        self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
+        self.conv.weight.data[:] = nn.Parameter(
+            torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
+        )  # / 120.0
+        self.c1 = c1
+        # self.bn = nn.BatchNorm2d(4)
 
     def forward(self, x):
-        x = self.ma(self.q(x), self.k(x), self.v(x))[0] + x
-        x = self.fc2(self.fc1(x)) + x
-        return x
-
-
-class TransformerBlock(nn.Module):
-    # Vision Transformer https://arxiv.org/abs/2010.11929
-    def __init__(self, c1, c2, num_heads, num_layers):
-        super().__init__()
-        self.conv = None
-        if c1 != c2:
-            self.conv = Conv(c1, c2)
-        self.linear = nn.Linear(c2, c2)  # learnable position embedding
-        self.tr = nn.Sequential(
-            *(TransformerLayer(c2, num_heads) for _ in range(num_layers))
+        b, c, a = x.shape  # batch, channels, anchors
+        return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(
+            b, 4, a
         )
-        self.c2 = c2
+        # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
+
+
+class BottleneckBase(nn.Module):
+    # Standard bottleneck
+    def __init__(
+        self, c1, c2, shortcut=True, g=1, k=(1, 3), e=0.5
+    ):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        if self.conv is not None:
-            x = self.conv(x)
-        b, _, w, h = x.shape
-        p = x.flatten(2).permute(2, 0, 1)
-        return self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class RBottleneckBase(nn.Module):
+    # Standard bottleneck
+    def __init__(
+        self, c1, c2, shortcut=True, g=1, k=(3, 1), e=0.5
+    ):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class RepNRBottleneckBase(nn.Module):
+    # Standard bottleneck
+    def __init__(
+        self, c1, c2, shortcut=True, g=1, k=(3, 1), e=0.5
+    ):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = RepConvN(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
 class Bottleneck(nn.Module):
     # Standard bottleneck
     def __init__(
-        self, c1, c2, shortcut=True, g=1, e=0.5
-    ):  # ch_in, ch_out, shortcut, groups, expansion
+        self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5
+    ):  # ch_in, ch_out, shortcut, kernels, groups, expand
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class RepNBottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(
+        self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5
+    ):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = RepConvN(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class Res(nn.Module):
+    # ResNet bottleneck
+    def __init__(
+        self, c1, c2, shortcut=True, g=1, e=0.5
+    ):  # ch_in, ch_out, shortcut, groups, expansion
+        super(Res, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c_, 3, 1, g=g)
+        self.cv3 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return (
+            x + self.cv3(self.cv2(self.cv1(x)))
+            if self.add
+            else self.cv3(self.cv2(self.cv1(x)))
+        )
+
+
+class RepNRes(nn.Module):
+    # ResNet bottleneck
+    def __init__(
+        self, c1, c2, shortcut=True, g=1, e=0.5
+    ):  # ch_in, ch_out, shortcut, groups, expansion
+        super(RepNRes, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = RepConvN(c_, c_, 3, 1, g=g)
+        self.cv3 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return (
+            x + self.cv3(self.cv2(self.cv1(x)))
+            if self.add
+            else self.cv3(self.cv2(self.cv1(x)))
+        )
 
 
 class BottleneckCSP(nn.Module):
@@ -398,21 +436,7 @@ class BottleneckCSP(nn.Module):
         return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
 
 
-class CrossConv(nn.Module):
-    # Cross Convolution Downsample
-    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
-        # ch_in, ch_out, kernel, stride, groups, expansion, shortcut
-        super().__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, (1, k), (1, s))
-        self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
-
-
-class C3(nn.Module):
+class CSP(nn.Module):
     # CSP Bottleneck with 3 convolutions
     def __init__(
         self, c1, c2, n=1, shortcut=True, g=1, e=0.5
@@ -430,38 +454,40 @@ class C3(nn.Module):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
-class C3x(C3):
-    # C3 module with cross-convolutions
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        c_ = int(c2 * e)
+class RepNCSP(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(
+        self, c1, c2, n=1, shortcut=True, g=1, e=0.5
+    ):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
         self.m = nn.Sequential(
-            *(CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n))
+            *(RepNBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n))
         )
 
-
-class C3TR(C3):
-    # C3 module with TransformerBlock()
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        c_ = int(c2 * e)
-        self.m = TransformerBlock(c_, c_, 4, n)
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
-class C3SPP(C3):
-    # C3 module with SPP()
-    def __init__(self, c1, c2, k=(5, 9, 13), n=1, shortcut=True, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        c_ = int(c2 * e)
-        self.m = SPP(c_, c_, k)
-
-
-class C3Ghost(C3):
-    # C3 module with GhostBottleneck()
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
+class CSPBase(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(
+        self, c1, c2, n=1, shortcut=True, g=1, e=0.5
+    ):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(
+            *(BottleneckBase(c_, c_, shortcut, g, e=1.0) for _ in range(n))
+        )
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
 class SPP(nn.Module):
@@ -482,22 +508,41 @@ class SPP(nn.Module):
             return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
 
-class SPPF(nn.Module):
-    # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
-    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+class ASPP(torch.nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        kernel_sizes = [1, 3, 3, 1]
+        dilations = [1, 3, 6, 1]
+        paddings = [0, 3, 6, 0]
+        self.aspp = torch.nn.ModuleList()
+        for aspp_idx in range(len(kernel_sizes)):
+            conv = torch.nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_sizes[aspp_idx],
+                stride=1,
+                dilation=dilations[aspp_idx],
+                padding=paddings[aspp_idx],
+                bias=True,
+            )
+            self.aspp.append(conv)
+        self.gap = torch.nn.AdaptiveAvgPool2d(1)
+        self.aspp_num = len(kernel_sizes)
+        for m in self.modules():
+            if isinstance(m, torch.nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2.0 / n))
+                m.bias.data.fill_(0)
 
     def forward(self, x):
-        x = self.cv1(x)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # suppress torch 1.9.0 max_pool2d() warning
-            y1 = self.m(x)
-            y2 = self.m(y1)
-            return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+        avg_x = self.gap(x)
+        out = []
+        for aspp_idx in range(self.aspp_num):
+            inp = avg_x if (aspp_idx == self.aspp_num - 1) else x
+            out.append(F.relu_(self.aspp[aspp_idx](inp)))
+        out[-1] = out[-1].expand_as(out[-2])
+        out = torch.cat(out, dim=1)
+        return out
 
 
 class SPPCSPC(nn.Module):
@@ -523,65 +568,44 @@ class SPPCSPC(nn.Module):
         return self.cv7(torch.cat((y1, y2), dim=1))
 
 
-class Focus(nn.Module):
-    # Focus wh information into c-space
-    def __init__(
-        self, c1, c2, k=1, s=1, p=None, g=1, act=True
-    ):  # ch_in, ch_out, kernel, stride, padding, groups
+class SPPF(nn.Module):
+    # Spatial Pyramid Pooling - Fast (SPPF) layer by Glenn Jocher
+    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
         super().__init__()
-        self.conv = Conv(c1 * 4, c2, k, s, p, g, act)
-        # self.contract = Contract(gain=2)
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        # self.m = SoftPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # suppress torch 1.9.0 max_pool2d() warning
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+
+
+import torch.nn.functional as F
+from torch.nn.modules.utils import _pair
+
+
+class ReOrg(nn.Module):
+    # yolo
+    def __init__(self):
+        super(ReOrg, self).__init__()
 
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
-        return self.conv(
-            torch.cat(
-                (
-                    x[..., ::2, ::2],
-                    x[..., 1::2, ::2],
-                    x[..., ::2, 1::2],
-                    x[..., 1::2, 1::2],
-                ),
-                1,
-            )
+        return torch.cat(
+            [
+                x[..., ::2, ::2],
+                x[..., 1::2, ::2],
+                x[..., ::2, 1::2],
+                x[..., 1::2, 1::2],
+            ],
+            1,
         )
-        # return self.conv(self.contract(x))
-
-
-class GhostConv(nn.Module):
-    # Ghost Convolution https://github.com/huawei-noah/ghostnet
-    def __init__(
-        self, c1, c2, k=1, s=1, g=1, act=True
-    ):  # ch_in, ch_out, kernel, stride, groups
-        super().__init__()
-        c_ = c2 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, k, s, None, g, act)
-        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act)
-
-    def forward(self, x):
-        y = self.cv1(x)
-        return torch.cat((y, self.cv2(y)), 1)
-
-
-class GhostBottleneck(nn.Module):
-    # Ghost Bottleneck https://github.com/huawei-noah/ghostnet
-    def __init__(self, c1, c2, k=3, s=1):  # ch_in, ch_out, kernel, stride
-        super().__init__()
-        c_ = c2 // 2
-        self.conv = nn.Sequential(
-            GhostConv(c1, c_, 1, 1),  # pw
-            DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
-            GhostConv(c_, c2, 1, 1, act=False),
-        )  # pw-linear
-        self.shortcut = (
-            nn.Sequential(
-                DWConv(c1, c1, k, s, act=False), Conv(c1, c2, 1, 1, act=False)
-            )
-            if s == 2
-            else nn.Identity()
-        )
-
-    def forward(self, x):
-        return self.conv(x) + self.shortcut(x)
 
 
 class Contract(nn.Module):
@@ -612,9 +636,9 @@ class Expand(nn.Module):
     def forward(self, x):
         b, c, h, w = x.size()  # assert C / s ** 2 == 0, 'Indivisible gain'
         s = self.gain
-        x = x.view(b, s, s, c // s**2, h, w)  # x(1,2,2,16,80,80)
+        x = x.view(b, s, s, c // s ** 2, h, w)  # x(1,2,2,16,80,80)
         x = x.permute(0, 3, 4, 1, 5, 2).contiguous()  # x(1,16,80,2,80,2)
-        return x.view(b, c // s**2, h * s, w * s)  # x(1,16,160,160)
+        return x.view(b, c // s ** 2, h * s, w * s)  # x(1,16,160,160)
 
 
 class Concat(nn.Module):
@@ -627,11 +651,138 @@ class Concat(nn.Module):
         return torch.cat(x, self.d)
 
 
+class Shortcut(nn.Module):
+    def __init__(self, dimension=0):
+        super(Shortcut, self).__init__()
+        self.d = dimension
+
+    def forward(self, x):
+        return x[0] + x[1]
+
+
+class Silence(nn.Module):
+    def __init__(self):
+        super(Silence, self).__init__()
+
+    def forward(self, x):
+        return x
+
+
+##### GELAN #####
+
+
+class SPPELAN(nn.Module):
+    # spp-elan
+    def __init__(
+        self, c1, c2, c3
+    ):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        self.c = c3
+        self.cv1 = Conv(c1, c3, 1, 1)
+        self.cv2 = SP(5)
+        self.cv3 = SP(5)
+        self.cv4 = SP(5)
+        self.cv5 = Conv(4 * c3, c2, 1, 1)
+
+    def forward(self, x):
+        y = [self.cv1(x)]
+        y.extend(m(y[-1]) for m in [self.cv2, self.cv3, self.cv4])
+        return self.cv5(torch.cat(y, 1))
+
+
+class RepNCSPELAN4(nn.Module):
+    # csp-elan
+    def __init__(
+        self, c1, c2, c3, c4, c5=1
+    ):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        self.c = c3 // 2
+        self.cv1 = Conv(c1, c3, 1, 1)
+        self.cv2 = nn.Sequential(RepNCSP(c3 // 2, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv3 = nn.Sequential(RepNCSP(c4, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv4 = Conv(c3 + (2 * c4), c2, 1, 1)
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        return self.cv4(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
+        return self.cv4(torch.cat(y, 1))
+
+
+#################
+
+
+##### YOLOR #####
+
+
+class ImplicitA(nn.Module):
+    def __init__(self, channel):
+        super(ImplicitA, self).__init__()
+        self.channel = channel
+        self.implicit = nn.Parameter(torch.zeros(1, channel, 1, 1))
+        nn.init.normal_(self.implicit, std=0.02)
+
+    def forward(self, x):
+        return self.implicit + x
+
+
+class ImplicitM(nn.Module):
+    def __init__(self, channel):
+        super(ImplicitM, self).__init__()
+        self.channel = channel
+        self.implicit = nn.Parameter(torch.ones(1, channel, 1, 1))
+        nn.init.normal_(self.implicit, mean=1.0, std=0.02)
+
+    def forward(self, x):
+        return self.implicit * x
+
+
+#################
+
+
+##### CBNet #####
+
+
+class CBLinear(nn.Module):
+    def __init__(
+        self, c1, c2s, k=1, s=1, p=None, g=1
+    ):  # ch_in, ch_outs, kernel, stride, padding, groups
+        super(CBLinear, self).__init__()
+        self.c2s = c2s
+        self.conv = nn.Conv2d(c1, sum(c2s), k, s, autopad(k, p), groups=g, bias=True)
+
+    def forward(self, x):
+        outs = self.conv(x).split(self.c2s, dim=1)
+        return outs
+
+
+class CBFuse(nn.Module):
+    def __init__(self, idx):
+        super(CBFuse, self).__init__()
+        self.idx = idx
+
+    def forward(self, xs):
+        target_size = xs[-1].shape[2:]
+        res = [
+            F.interpolate(x[self.idx[i]], size=target_size, mode="nearest")
+            for i, x in enumerate(xs[:-1])
+        ]
+        out = torch.sum(torch.stack(res + xs[-1:]), dim=0)
+        return out
+
+
+#################
+
+
 class DetectMultiBackend(nn.Module):
-    # YOLOv5 MultiBackend class for python inference on various backends
+    # YOLO MultiBackend class for python inference on various backends
     def __init__(
         self,
-        weights="yolov5s.pt",
+        weights="yolo.pt",
         device=torch.device("cpu"),
         dnn=False,
         data=None,
@@ -642,14 +793,15 @@ class DetectMultiBackend(nn.Module):
         #   PyTorch:              weights = *.pt
         #   TorchScript:                    *.torchscript
         #   ONNX Runtime:                   *.onnx
-        #   ONNX OpenCV DNN:                *.onnx with --dnn
-        #   OpenVINO:                       *.xml
+        #   ONNX OpenCV DNN:                *.onnx --dnn
+        #   OpenVINO:                       *_openvino_model
         #   CoreML:                         *.mlmodel
         #   TensorRT:                       *.engine
         #   TensorFlow SavedModel:          *_saved_model
         #   TensorFlow GraphDef:            *.pb
         #   TensorFlow Lite:                *.tflite
         #   TensorFlow Edge TPU:            *_edgetpu.tflite
+        #   PaddlePaddle:                   *_paddle_model
         from models.experimental import (
             attempt_download,
             attempt_load,
@@ -657,6 +809,8 @@ class DetectMultiBackend(nn.Module):
 
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
+        print("DEBUG: MODEL TYPES: ", self._model_type(w))
+        # Removed triton from below line as a workaround for now !
         (
             pt,
             jit,
@@ -669,12 +823,16 @@ class DetectMultiBackend(nn.Module):
             tflite,
             edgetpu,
             tfjs,
-        ) = self._model_type(
-            w
-        )  # get backend
-        w = attempt_download(w)  # download if not local
+            paddle,
+        ) = self._model_type(w)
         fp16 &= pt or jit or onnx or engine  # FP16
+        nhwc = (
+            coreml or saved_model or pb or tflite or edgetpu
+        )  # BHWC formats (vs torch BCWH)
         stride = 32  # default stride
+        cuda = torch.cuda.is_available() and device.type != "cpu"  # use CUDA
+        if not (pt):
+            w = attempt_download(w)  # download if not local
 
         if pt:  # PyTorch
             model = attempt_load(
@@ -692,18 +850,22 @@ class DetectMultiBackend(nn.Module):
         elif jit:  # TorchScript
             LOGGER.info(f"Loading {w} for TorchScript inference...")
             extra_files = {"config.txt": ""}  # model metadata
-            model = torch.jit.load(w, _extra_files=extra_files)
+            model = torch.jit.load(w, _extra_files=extra_files, map_location=device)
             model.half() if fp16 else model.float()
-            if extra_files["config.txt"]:
-                d = json.loads(extra_files["config.txt"])  # extra_files dict
+            if extra_files["config.txt"]:  # load metadata dict
+                d = json.loads(
+                    extra_files["config.txt"],
+                    object_hook=lambda d: {
+                        int(k) if k.isdigit() else k: v for k, v in d.items()
+                    },
+                )
                 stride, names = int(d["stride"]), d["names"]
         elif dnn:  # ONNX OpenCV DNN
             LOGGER.info(f"Loading {w} for ONNX OpenCV DNN inference...")
-            check_requirements(("opencv-python>=4.5.4",))
+            check_requirements("opencv-python>=4.5.4")
             net = cv2.dnn.readNetFromONNX(w)
         elif onnx:  # ONNX Runtime
             LOGGER.info(f"Loading {w} for ONNX Runtime inference...")
-            cuda = torch.cuda.is_available() and device.type != "cpu"
             check_requirements(("onnx", "onnxruntime-gpu" if cuda else "onnxruntime"))
             import onnxruntime
 
@@ -713,13 +875,14 @@ class DetectMultiBackend(nn.Module):
                 else ["CPUExecutionProvider"]
             )
             session = onnxruntime.InferenceSession(w, providers=providers)
+            output_names = [x.name for x in session.get_outputs()]
             meta = session.get_modelmeta().custom_metadata_map  # metadata
             if "stride" in meta:
                 stride, names = int(meta["stride"]), eval(meta["names"])
         elif xml:  # OpenVINO
             LOGGER.info(f"Loading {w} for OpenVINO inference...")
             check_requirements(
-                ("openvino",)
+                "openvino"
             )  # requires openvino-dev: https://pypi.org/project/openvino-dev/
             from openvino.runtime import Core, Layout, get_batch
 
@@ -737,10 +900,9 @@ class DetectMultiBackend(nn.Module):
             executable_network = ie.compile_model(
                 network, device_name="CPU"
             )  # device_name="MYRIAD" for Intel NCS2
-            output_layer = next(iter(executable_network.outputs))
-            meta = Path(w).with_suffix(".yaml")
-            if meta.exists():
-                stride, names = self._load_metadata(meta)  # load metadata
+            stride, names = self._load_metadata(
+                Path(w).with_suffix(".yaml")
+            )  # load metadata
         elif engine:  # TensorRT
             LOGGER.info(f"Loading {w} for TensorRT inference...")
             import tensorrt as trt  # https://developer.nvidia.com/nvidia-tensorrt-download
@@ -756,20 +918,23 @@ class DetectMultiBackend(nn.Module):
                 model = runtime.deserialize_cuda_engine(f.read())
             context = model.create_execution_context()
             bindings = OrderedDict()
+            output_names = []
             fp16 = False  # default updated below
             dynamic = False
-            for index in range(model.num_bindings):
-                name = model.get_binding_name(index)
-                dtype = trt.nptype(model.get_binding_dtype(index))
-                if model.binding_is_input(index):
-                    if -1 in tuple(model.get_binding_shape(index)):  # dynamic
+            for i in range(model.num_bindings):
+                name = model.get_binding_name(i)
+                dtype = trt.nptype(model.get_binding_dtype(i))
+                if model.binding_is_input(i):
+                    if -1 in tuple(model.get_binding_shape(i)):  # dynamic
                         dynamic = True
                         context.set_binding_shape(
-                            index, tuple(model.get_profile_shape(0, index)[2])
+                            i, tuple(model.get_profile_shape(0, i)[2])
                         )
                     if dtype == np.float16:
                         fp16 = True
-                shape = tuple(context.get_binding_shape(index))
+                else:  # output
+                    output_names.append(name)
+                shape = tuple(context.get_binding_shape(i))
                 im = torch.from_numpy(np.empty(shape, dtype=dtype)).to(device)
                 bindings[name] = Binding(name, dtype, shape, im, int(im.data_ptr()))
             binding_addrs = OrderedDict((n, d.ptr) for n, d in bindings.items())
@@ -781,76 +946,111 @@ class DetectMultiBackend(nn.Module):
             import coremltools as ct
 
             model = ct.models.MLModel(w)
-        else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
-            if saved_model:  # SavedModel
-                LOGGER.info(f"Loading {w} for TensorFlow SavedModel inference...")
+        elif saved_model:  # TF SavedModel
+            LOGGER.info(f"Loading {w} for TensorFlow SavedModel inference...")
+            import tensorflow as tf
+
+            keras = False  # assume TF1 saved_model
+            model = tf.keras.models.load_model(w) if keras else tf.saved_model.load(w)
+        elif (
+            pb
+        ):  # GraphDef https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
+            LOGGER.info(f"Loading {w} for TensorFlow GraphDef inference...")
+            import tensorflow as tf
+
+            def wrap_frozen_graph(gd, inputs, outputs):
+                x = tf.compat.v1.wrap_function(
+                    lambda: tf.compat.v1.import_graph_def(gd, name=""), []
+                )  # wrapped
+                ge = x.graph.as_graph_element
+                return x.prune(
+                    tf.nest.map_structure(ge, inputs),
+                    tf.nest.map_structure(ge, outputs),
+                )
+
+            def gd_outputs(gd):
+                name_list, input_list = [], []
+                for node in gd.node:  # tensorflow.core.framework.node_def_pb2.NodeDef
+                    name_list.append(node.name)
+                    input_list.extend(node.input)
+                return sorted(
+                    f"{x}:0"
+                    for x in list(set(name_list) - set(input_list))
+                    if not x.startswith("NoOp")
+                )
+
+            gd = tf.Graph().as_graph_def()  # TF GraphDef
+            with open(w, "rb") as f:
+                gd.ParseFromString(f.read())
+            frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs=gd_outputs(gd))
+        elif (
+            tflite or edgetpu
+        ):  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
+            try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
+                from tflite_runtime.interpreter import Interpreter, load_delegate
+            except ImportError:
                 import tensorflow as tf
 
-                keras = False  # assume TF1 saved_model
-                model = (
-                    tf.keras.models.load_model(w) if keras else tf.saved_model.load(w)
+                Interpreter, load_delegate = (
+                    tf.lite.Interpreter,
+                    tf.lite.experimental.load_delegate,
                 )
-            elif (
-                pb
-            ):  # GraphDef https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
-                LOGGER.info(f"Loading {w} for TensorFlow GraphDef inference...")
-                import tensorflow as tf
-
-                def wrap_frozen_graph(gd, inputs, outputs):
-                    x = tf.compat.v1.wrap_function(
-                        lambda: tf.compat.v1.import_graph_def(gd, name=""), []
-                    )  # wrapped
-                    ge = x.graph.as_graph_element
-                    return x.prune(
-                        tf.nest.map_structure(ge, inputs),
-                        tf.nest.map_structure(ge, outputs),
-                    )
-
-                gd = tf.Graph().as_graph_def()  # graph_def
-                with open(w, "rb") as f:
-                    gd.ParseFromString(f.read())
-                frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs="Identity:0")
-            elif (
-                tflite or edgetpu
-            ):  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
-                try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
-                    from tflite_runtime.interpreter import Interpreter, load_delegate
-                except ImportError:
-                    import tensorflow as tf
-
-                    Interpreter, load_delegate = (
-                        tf.lite.Interpreter,
-                        tf.lite.experimental.load_delegate,
-                    )
-                if edgetpu:  # Edge TPU https://coral.ai/software/#edgetpu-runtime
-                    LOGGER.info(
-                        f"Loading {w} for TensorFlow Lite Edge TPU inference..."
-                    )
-                    delegate = {
-                        "Linux": "libedgetpu.so.1",
-                        "Darwin": "libedgetpu.1.dylib",
-                        "Windows": "edgetpu.dll",
-                    }[platform.system()]
-                    interpreter = Interpreter(
-                        model_path=w, experimental_delegates=[load_delegate(delegate)]
-                    )
-                else:  # Lite
-                    LOGGER.info(f"Loading {w} for TensorFlow Lite inference...")
-                    interpreter = Interpreter(model_path=w)  # load TFLite model
-                interpreter.allocate_tensors()  # allocate
-                input_details = interpreter.get_input_details()  # inputs
-                output_details = interpreter.get_output_details()  # outputs
-            elif tfjs:
-                raise NotImplementedError(
-                    "ERROR: YOLOv5 TF.js inference is not supported"
+            if edgetpu:  # TF Edge TPU https://coral.ai/software/#edgetpu-runtime
+                LOGGER.info(f"Loading {w} for TensorFlow Lite Edge TPU inference...")
+                delegate = {
+                    "Linux": "libedgetpu.so.1",
+                    "Darwin": "libedgetpu.1.dylib",
+                    "Windows": "edgetpu.dll",
+                }[platform.system()]
+                interpreter = Interpreter(
+                    model_path=w, experimental_delegates=[load_delegate(delegate)]
                 )
-            else:
-                raise NotImplementedError(f"ERROR: {w} is not a supported format")
+            else:  # TFLite
+                LOGGER.info(f"Loading {w} for TensorFlow Lite inference...")
+                interpreter = Interpreter(model_path=w)  # load TFLite model
+            interpreter.allocate_tensors()  # allocate
+            input_details = interpreter.get_input_details()  # inputs
+            output_details = interpreter.get_output_details()  # outputs
+            # load metadata
+            with contextlib.suppress(zipfile.BadZipFile):
+                with zipfile.ZipFile(w, "r") as model:
+                    meta_file = model.namelist()[0]
+                    meta = ast.literal_eval(model.read(meta_file).decode("utf-8"))
+                    stride, names = int(meta["stride"]), meta["names"]
+        elif tfjs:  # TF.js
+            raise NotImplementedError("ERROR: YOLO TF.js inference is not supported")
+        elif paddle:  # PaddlePaddle
+            LOGGER.info(f"Loading {w} for PaddlePaddle inference...")
+            check_requirements("paddlepaddle-gpu" if cuda else "paddlepaddle")
+            import paddle.inference as pdi
+
+            if not Path(w).is_file():  # if not *.pdmodel
+                w = next(
+                    Path(w).rglob("*.pdmodel")
+                )  # get *.pdmodel file from *_paddle_model dir
+            weights = Path(w).with_suffix(".pdiparams")
+            config = pdi.Config(str(w), str(weights))
+            if cuda:
+                config.enable_use_gpu(memory_pool_init_size_mb=2048, device_id=0)
+            predictor = pdi.create_predictor(config)
+            input_handle = predictor.get_input_handle(predictor.get_input_names()[0])
+            output_names = predictor.get_output_names()
+        # elif triton:  # NVIDIA Triton Inference Server
+        #     LOGGER.info(f"Using {w} as Triton Inference Server...")
+        #     check_requirements("tritonclient[all]")
+        #     from utils.triton import TritonRemoteModel
+
+        #     model = TritonRemoteModel(url=w)
+        #     nhwc = model.runtime.startswith("tensorflow")
+        else:
+            raise NotImplementedError(f"ERROR: {w} is not a supported format")
 
         # class names
         if "names" not in locals():
             names = (
-                yaml_load(data)["names"] if data else [f"class{i}" for i in range(999)]
+                yaml_load(data)["names"]
+                if data
+                else {i: f"class{i}" for i in range(999)}
             )
         if names[0] == "n01440764" and len(names) == 1000:  # ImageNet
             names = yaml_load(ROOT / "data/ImageNet.yaml")[
@@ -859,11 +1059,13 @@ class DetectMultiBackend(nn.Module):
 
         self.__dict__.update(locals())  # assign all variables to self
 
-    def forward(self, im, augment=False, visualize=False, val=False):
-        # YOLOv5 MultiBackend inference
+    def forward(self, im, augment=False, visualize=False):
+        # YOLO MultiBackend inference
         b, ch, h, w = im.shape  # batch, channel, height, width
         if self.fp16 and im.dtype != torch.float16:
             im = im.half()  # to FP16
+        if self.nhwc:
+            im = im.permute(0, 2, 3, 1)  # torch BCHW to numpy BHWC shape(1,320,192,3)
 
         if self.pt:  # PyTorch
             y = (
@@ -871,10 +1073,8 @@ class DetectMultiBackend(nn.Module):
                 if augment or visualize
                 else self.model(im)
             )
-            if isinstance(y, tuple):
-                y = y[0]
         elif self.jit:  # TorchScript
-            y = self.model(im)[0]
+            y = self.model(im)
         elif self.dnn:  # ONNX OpenCV DNN
             im = im.cpu().numpy()  # torch to numpy
             self.net.setInput(im)
@@ -882,35 +1082,32 @@ class DetectMultiBackend(nn.Module):
         elif self.onnx:  # ONNX Runtime
             im = im.cpu().numpy()  # torch to numpy
             y = self.session.run(
-                [self.session.get_outputs()[0].name],
-                {self.session.get_inputs()[0].name: im},
-            )[0]
+                self.output_names, {self.session.get_inputs()[0].name: im}
+            )
         elif self.xml:  # OpenVINO
             im = im.cpu().numpy()  # FP32
-            y = self.executable_network([im])[self.output_layer]
+            y = list(self.executable_network([im]).values())
         elif self.engine:  # TensorRT
             if self.dynamic and im.shape != self.bindings["images"].shape:
-                i_in, i_out = (
-                    self.model.get_binding_index(x) for x in ("images", "output")
-                )
-                self.context.set_binding_shape(i_in, im.shape)  # reshape if dynamic
+                i = self.model.get_binding_index("images")
+                self.context.set_binding_shape(i, im.shape)  # reshape if dynamic
                 self.bindings["images"] = self.bindings["images"]._replace(
                     shape=im.shape
                 )
-                self.bindings["output"].data.resize_(
-                    tuple(self.context.get_binding_shape(i_out))
-                )
+                for name in self.output_names:
+                    i = self.model.get_binding_index(name)
+                    self.bindings[name].data.resize_(
+                        tuple(self.context.get_binding_shape(i))
+                    )
             s = self.bindings["images"].shape
             assert (
                 im.shape == s
             ), f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
             self.binding_addrs["images"] = int(im.data_ptr())
             self.context.execute_v2(list(self.binding_addrs.values()))
-            y = self.bindings["output"].data
+            y = [self.bindings[x].data for x in sorted(self.output_names)]
         elif self.coreml:  # CoreML
-            im = (
-                im.permute(0, 2, 3, 1).cpu().numpy()
-            )  # torch BCHW to numpy BHWC shape(1,320,192,3)
+            im = im.cpu().numpy()
             im = Image.fromarray((im[0] * 255).astype("uint8"))
             # im = im.resize((192, 320), Image.ANTIALIAS)
             y = self.model.predict({"image": im})  # coordinates are xywh normalized
@@ -921,37 +1118,54 @@ class DetectMultiBackend(nn.Module):
                 )
                 y = np.concatenate((box, conf.reshape(-1, 1), cls.reshape(-1, 1)), 1)
             else:
-                k = "var_" + str(
-                    sorted(int(k.replace("var_", "")) for k in y)[-1]
-                )  # output key
-                y = y[k]  # output
+                y = list(
+                    reversed(y.values())
+                )  # reversed for segmentation models (pred, proto)
+        elif self.paddle:  # PaddlePaddle
+            im = im.cpu().numpy().astype(np.float32)
+            self.input_handle.copy_from_cpu(im)
+            self.predictor.run()
+            y = [
+                self.predictor.get_output_handle(x).copy_to_cpu()
+                for x in self.output_names
+            ]
+        elif self.triton:  # NVIDIA Triton Inference Server
+            y = self.model(im)
         else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
-            im = (
-                im.permute(0, 2, 3, 1).cpu().numpy()
-            )  # torch BCHW to numpy BHWC shape(1,320,192,3)
+            im = im.cpu().numpy()
             if self.saved_model:  # SavedModel
-                y = (
-                    self.model(im, training=False) if self.keras else self.model(im)
-                ).numpy()
+                y = self.model(im, training=False) if self.keras else self.model(im)
             elif self.pb:  # GraphDef
-                y = self.frozen_func(x=self.tf.constant(im)).numpy()
+                y = self.frozen_func(x=self.tf.constant(im))
             else:  # Lite or Edge TPU
-                input, output = self.input_details[0], self.output_details[0]
+                input = self.input_details[0]
                 int8 = input["dtype"] == np.uint8  # is TFLite quantized uint8 model
                 if int8:
                     scale, zero_point = input["quantization"]
                     im = (im / scale + zero_point).astype(np.uint8)  # de-scale
                 self.interpreter.set_tensor(input["index"], im)
                 self.interpreter.invoke()
-                y = self.interpreter.get_tensor(output["index"])
-                if int8:
-                    scale, zero_point = output["quantization"]
-                    y = (y.astype(np.float32) - zero_point) * scale  # re-scale
-            y[..., :4] *= [w, h, w, h]  # xywh normalized to pixels
+                y = []
+                for output in self.output_details:
+                    x = self.interpreter.get_tensor(output["index"])
+                    if int8:
+                        scale, zero_point = output["quantization"]
+                        x = (x.astype(np.float32) - zero_point) * scale  # re-scale
+                    y.append(x)
+            y = [x if isinstance(x, np.ndarray) else x.numpy() for x in y]
+            y[0][..., :4] *= [w, h, w, h]  # xywh normalized to pixels
 
-        if isinstance(y, np.ndarray):
-            y = torch.tensor(y, device=self.device)
-        return (y, []) if val else y
+        if isinstance(y, (list, tuple)):
+            return (
+                self.from_numpy(y[0])
+                if len(y) == 1
+                else [self.from_numpy(x) for x in y]
+            )
+        else:
+            return self.from_numpy(y)
+
+    def from_numpy(self, x):
+        return torch.from_numpy(x).to(self.device) if isinstance(x, np.ndarray) else x
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
         # Warmup model by running inference once
@@ -962,9 +1176,10 @@ class DetectMultiBackend(nn.Module):
             self.engine,
             self.saved_model,
             self.pb,
+            # self.triton,
         )
-        if any(warmup_types) and self.device.type != "cpu":
-            im = torch.zeros(
+        if any(warmup_types) and (self.device.type != "cpu"):
+            im = torch.empty(
                 *imgsz,
                 dtype=torch.half if self.fp16 else torch.float,
                 device=self.device,
@@ -975,50 +1190,32 @@ class DetectMultiBackend(nn.Module):
     @staticmethod
     def _model_type(p="path/to/model.pt"):
         # Return model type from model path, i.e. path='path/to/model.onnx' -> type=onnx
+        # types = [pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle]
         from export import export_formats
+        from utils.downloads import is_url
 
-        suffixes = list(export_formats().Suffix) + [".xml"]  # export suffixes
-        check_suffix(p, suffixes)  # checks
-        p = Path(p).name  # eliminate trailing separators
-        (
-            pt,
-            jit,
-            onnx,
-            xml,
-            engine,
-            coreml,
-            saved_model,
-            pb,
-            tflite,
-            edgetpu,
-            tfjs,
-            xml2,
-        ) = (s in p for s in suffixes)
-        xml |= xml2  # *_openvino_model or *.xml
-        tflite &= not edgetpu  # *.tflite
-        return (
-            pt,
-            jit,
-            onnx,
-            xml,
-            engine,
-            coreml,
-            saved_model,
-            pb,
-            tflite,
-            edgetpu,
-            tfjs,
+        sf = list(export_formats().Suffix)  # export suffixes
+        if not is_url(p, check=False):
+            check_suffix(p, sf)  # checks
+        url = urlparse(p)  # if url may be Triton inference server
+        types = [s in Path(p).name for s in sf]
+        types[8] &= not types[9]  # tflite &= not edgetpu
+        triton = not any(types) and all(
+            [any(s in url.scheme for s in ["http", "grpc"]), url.netloc]
         )
+        return types + [triton]
 
     @staticmethod
-    def _load_metadata(f="path/to/meta.yaml"):
+    def _load_metadata(f=Path("path/to/meta.yaml")):
         # Load metadata from meta.yaml if it exists
-        d = yaml_load(f)
-        return d["stride"], d["names"]  # assign stride, names
+        if f.exists():
+            d = yaml_load(f)
+            return d["stride"], d["names"]  # assign stride, names
+        return None, None
 
 
 class AutoShape(nn.Module):
-    # YOLOv5 input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
+    # YOLO input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
     conf = 0.25  # NMS confidence threshold
     iou = 0.45  # NMS IoU threshold
     agnostic = False  # NMS class-agnostic
@@ -1047,24 +1244,29 @@ class AutoShape(nn.Module):
                 self.model.model.model[-1] if self.dmb else self.model.model[-1]
             )  # Detect()
             m.inplace = False  # Detect.inplace=False for safe multithread inference
+            m.export = True  # do not output loss values
 
     def _apply(self, fn):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
         self = super()._apply(fn)
+        from models.yolo import Detect, Segment
+
         if self.pt:
             m = (
                 self.model.model.model[-1] if self.dmb else self.model.model[-1]
             )  # Detect()
-            m.stride = fn(m.stride)
-            m.grid = list(map(fn, m.grid))
-            if isinstance(m.anchor_grid, list):
-                m.anchor_grid = list(map(fn, m.anchor_grid))
+            if isinstance(m, (Detect, Segment)):
+                for k in "stride", "anchor_grid", "stride_grid", "grid":
+                    x = getattr(m, k)
+                    setattr(m, k, list(map(fn, x))) if isinstance(
+                        x, (list, tuple)
+                    ) else setattr(m, k, fn(x))
         return self
 
     @smart_inference_mode()
-    def forward(self, imgs, size=640, augment=False, profile=False):
-        # Inference from various sources. For height=640, width=1280, RGB images example inputs are:
-        #   file:       imgs = 'data/images/zidane.jpg'  # str or PosixPath
+    def forward(self, ims, size=640, augment=False, profile=False):
+        # Inference from various sources. For size(height=640, width=1280), RGB images example inputs are:
+        #   file:        ims = 'data/images/zidane.jpg'  # str or PosixPath
         #   URI:             = 'https://ultralytics.com/images/zidane.jpg'
         #   OpenCV:          = cv2.imread('image.jpg')[:,:,::-1]  # HWC BGR to RGB x(640,1280,3)
         #   PIL:             = Image.open('image.jpg') or ImageGrab.grab()  # HWC x(640,1280,3)
@@ -1072,94 +1274,104 @@ class AutoShape(nn.Module):
         #   torch:           = torch.zeros(16,3,320,640)  # BCHW (scaled to size=640, 0-1 values)
         #   multiple:        = [Image.open('image1.jpg'), Image.open('image2.jpg'), ...]  # list of images
 
-        t = [time_sync()]
-        p = (
-            next(self.model.parameters())
-            if self.pt
-            else torch.zeros(1, device=self.model.device)
-        )  # for device, type
-        autocast = self.amp and (
-            p.device.type != "cpu"
-        )  # Automatic Mixed Precision (AMP) inference
-        if isinstance(imgs, torch.Tensor):  # torch
-            with amp.autocast(autocast):
-                return self.model(
-                    imgs.to(p.device).type_as(p), augment, profile
-                )  # inference
+        dt = (Profile(), Profile(), Profile())
+        with dt[0]:
+            if isinstance(size, int):  # expand
+                size = (size, size)
+            p = (
+                next(self.model.parameters())
+                if self.pt
+                else torch.empty(1, device=self.model.device)
+            )  # param
+            autocast = self.amp and (
+                p.device.type != "cpu"
+            )  # Automatic Mixed Precision (AMP) inference
+            if isinstance(ims, torch.Tensor):  # torch
+                with amp.autocast(autocast):
+                    return self.model(
+                        ims.to(p.device).type_as(p), augment=augment
+                    )  # inference
 
-        # Pre-process
-        n, imgs = (
-            (len(imgs), list(imgs)) if isinstance(imgs, (list, tuple)) else (1, [imgs])
-        )  # number, list of images
-        shape0, shape1, files = [], [], []  # image and inference shapes, filenames
-        for i, im in enumerate(imgs):
-            f = f"image{i}"  # filename
-            if isinstance(im, (str, Path)):  # filename or uri
-                im, f = (
-                    Image.open(
-                        requests.get(im, stream=True).raw
-                        if str(im).startswith("http")
-                        else im
-                    ),
-                    im,
-                )
-                im = np.asarray(exif_transpose(im))
-            elif isinstance(im, Image.Image):  # PIL Image
-                im, f = np.asarray(exif_transpose(im)), getattr(im, "filename", f) or f
-            files.append(Path(f).with_suffix(".jpg").name)
-            if im.shape[0] < 5:  # image in CHW
-                im = im.transpose((1, 2, 0))  # reverse dataloader .transpose(2, 0, 1)
-            im = (
-                im[..., :3] if im.ndim == 3 else np.tile(im[..., None], 3)
-            )  # enforce 3ch input
-            s = im.shape[:2]  # HWC
-            shape0.append(s)  # image shape
-            g = size / max(s)  # gain
-            shape1.append([y * g for y in s])
-            imgs[i] = im if im.data.contiguous else np.ascontiguousarray(im)  # update
-        shape1 = [
-            make_divisible(x, self.stride) if self.pt else size
-            for x in np.array(shape1).max(0)
-        ]  # inf shape
-        x = [letterbox(im, shape1, auto=False)[0] for im in imgs]  # pad
-        x = np.ascontiguousarray(
-            np.array(x).transpose((0, 3, 1, 2))
-        )  # stack and BHWC to BCHW
-        x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
-        t.append(time_sync())
+            # Pre-process
+            n, ims = (
+                (len(ims), list(ims)) if isinstance(ims, (list, tuple)) else (1, [ims])
+            )  # number, list of images
+            shape0, shape1, files = [], [], []  # image and inference shapes, filenames
+            for i, im in enumerate(ims):
+                f = f"image{i}"  # filename
+                if isinstance(im, (str, Path)):  # filename or uri
+                    im, f = (
+                        Image.open(
+                            requests.get(im, stream=True).raw
+                            if str(im).startswith("http")
+                            else im
+                        ),
+                        im,
+                    )
+                    im = np.asarray(exif_transpose(im))
+                elif isinstance(im, Image.Image):  # PIL Image
+                    im, f = (
+                        np.asarray(exif_transpose(im)),
+                        getattr(im, "filename", f) or f,
+                    )
+                files.append(Path(f).with_suffix(".jpg").name)
+                if im.shape[0] < 5:  # image in CHW
+                    im = im.transpose(
+                        (1, 2, 0)
+                    )  # reverse dataloader .transpose(2, 0, 1)
+                im = (
+                    im[..., :3]
+                    if im.ndim == 3
+                    else cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+                )  # enforce 3ch input
+                s = im.shape[:2]  # HWC
+                shape0.append(s)  # image shape
+                g = max(size) / max(s)  # gain
+                shape1.append([int(y * g) for y in s])
+                ims[i] = (
+                    im if im.data.contiguous else np.ascontiguousarray(im)
+                )  # update
+            shape1 = [
+                make_divisible(x, self.stride) for x in np.array(shape1).max(0)
+            ]  # inf shape
+            x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
+            x = np.ascontiguousarray(
+                np.array(x).transpose((0, 3, 1, 2))
+            )  # stack and BHWC to BCHW
+            x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
 
         with amp.autocast(autocast):
             # Inference
-            y = self.model(x, augment, profile)  # forward
-            t.append(time_sync())
+            with dt[1]:
+                y = self.model(x, augment=augment)  # forward
 
             # Post-process
-            y = non_max_suppression(
-                y if self.dmb else y[0],
-                self.conf,
-                self.iou,
-                self.classes,
-                self.agnostic,
-                self.multi_label,
-                max_det=self.max_det,
-            )  # NMS
-            for i in range(n):
-                scale_coords(shape1, y[i][:, :4], shape0[i])
+            with dt[2]:
+                y = non_max_suppression(
+                    y if self.dmb else y[0],
+                    self.conf,
+                    self.iou,
+                    self.classes,
+                    self.agnostic,
+                    self.multi_label,
+                    max_det=self.max_det,
+                )  # NMS
+                for i in range(n):
+                    scale_boxes(shape1, y[i][:, :4], shape0[i])
 
-            t.append(time_sync())
-            return Detections(imgs, y, files, t, self.names, x.shape)
+            return Detections(ims, y, files, dt, self.names, x.shape)
 
 
 class Detections:
-    # YOLOv5 detections class for inference results
-    def __init__(self, imgs, pred, files, times=(0, 0, 0, 0), names=None, shape=None):
+    # YOLO detections class for inference results
+    def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None):
         super().__init__()
         d = pred[0].device  # device
         gn = [
             torch.tensor([*(im.shape[i] for i in [1, 0, 1, 0]), 1, 1], device=d)
-            for im in imgs
+            for im in ims
         ]  # normalizations
-        self.imgs = imgs  # list of images as numpy arrays
+        self.ims = ims  # list of images as numpy arrays
         self.pred = pred  # list of tensors pred[0] = (xyxy, conf, cls)
         self.names = names  # class names
         self.files = files  # image filenames
@@ -1169,12 +1381,10 @@ class Detections:
         self.xyxyn = [x / g for x, g in zip(self.xyxy, gn)]  # xyxy normalized
         self.xywhn = [x / g for x, g in zip(self.xywh, gn)]  # xywh normalized
         self.n = len(self.pred)  # number of images (batch size)
-        self.t = tuple(
-            (times[i + 1] - times[i]) * 1000 / self.n for i in range(3)
-        )  # timestamps (ms)
-        self.s = shape  # inference BCHW shape
+        self.t = tuple(x.t / self.n * 1e3 for x in times)  # timestamps (ms)
+        self.s = tuple(shape)  # inference BCHW shape
 
-    def display(
+    def _run(
         self,
         pprint=False,
         show=False,
@@ -1184,13 +1394,14 @@ class Detections:
         labels=True,
         save_dir=Path(""),
     ):
-        crops = []
-        for i, (im, pred) in enumerate(zip(self.imgs, self.pred)):
-            s = f"image {i + 1}/{len(self.pred)}: {im.shape[0]}x{im.shape[1]} "  # string
+        s, crops = "", []
+        for i, (im, pred) in enumerate(zip(self.ims, self.pred)):
+            s += f"\nimage {i + 1}/{len(self.pred)}: {im.shape[0]}x{im.shape[1]} "  # string
             if pred.shape[0]:
                 for c in pred[:, -1].unique():
                     n = (pred[:, -1] == c).sum()  # detections per class
                     s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                s = s.rstrip(", ")
                 if show or save or render or crop:
                     annotator = Annotator(im, example=str(self.names))
                     for *box, conf, cls in reversed(pred):  # xyxy, confidence, class
@@ -1226,10 +1437,8 @@ class Detections:
                 if isinstance(im, np.ndarray)
                 else im
             )  # from np
-            if pprint:
-                print(s.rstrip(", "))
             if show:
-                im.show(self.files[i])  # show
+                display(im) if is_notebook() else im.show(self.files[i])
             if save:
                 f = self.files[i]
                 im.save(save_dir / f)  # save
@@ -1238,39 +1447,33 @@ class Detections:
                         f"Saved {self.n} image{'s' * (self.n > 1)} to {colorstr('bold', save_dir)}"
                     )
             if render:
-                self.imgs[i] = np.asarray(im)
+                self.ims[i] = np.asarray(im)
+        if pprint:
+            s = s.lstrip("\n")
+            return (
+                f"{s}\nSpeed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {self.s}"
+                % self.t
+            )
         if crop:
             if save:
                 LOGGER.info(f"Saved results to {save_dir}\n")
             return crops
 
-    def print(self):
-        self.display(pprint=True)  # print results
-        print(
-            f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}"
-            % self.t
-        )
-
+    @TryExcept("Showing images is not supported in this environment")
     def show(self, labels=True):
-        self.display(show=True, labels=labels)  # show results
+        self._run(show=True, labels=labels)  # show results
 
-    def save(self, labels=True, save_dir="runs/detect/exp"):
-        save_dir = increment_path(
-            save_dir, exist_ok=save_dir != "runs/detect/exp", mkdir=True
-        )  # increment save_dir
-        self.display(save=True, labels=labels, save_dir=save_dir)  # save results
+    def save(self, labels=True, save_dir="runs/detect/exp", exist_ok=False):
+        save_dir = increment_path(save_dir, exist_ok, mkdir=True)  # increment save_dir
+        self._run(save=True, labels=labels, save_dir=save_dir)  # save results
 
-    def crop(self, save=True, save_dir="runs/detect/exp"):
-        save_dir = (
-            increment_path(save_dir, exist_ok=save_dir != "runs/detect/exp", mkdir=True)
-            if save
-            else None
-        )
-        return self.display(crop=True, save=save, save_dir=save_dir)  # crop results
+    def crop(self, save=True, save_dir="runs/detect/exp", exist_ok=False):
+        save_dir = increment_path(save_dir, exist_ok, mkdir=True) if save else None
+        return self._run(crop=True, save=save, save_dir=save_dir)  # crop results
 
     def render(self, labels=True):
-        self.display(render=True, labels=labels)  # render results
-        return self.imgs
+        self._run(render=True, labels=labels)  # render results
+        return self.ims
 
     def pandas(self):
         # return detections as pandas DataFrames, i.e. print(results.pandas().xyxy[0])
@@ -1306,7 +1509,7 @@ class Detections:
         r = range(self.n)  # iterable
         x = [
             Detections(
-                [self.imgs[i]],
+                [self.ims[i]],
                 [self.pred[i]],
                 [self.files[i]],
                 self.times,
@@ -1316,20 +1519,38 @@ class Detections:
             for i in r
         ]
         # for d in x:
-        #    for k in ['imgs', 'pred', 'xyxy', 'xyxyn', 'xywh', 'xywhn']:
+        #    for k in ['ims', 'pred', 'xyxy', 'xyxyn', 'xywh', 'xywhn']:
         #        setattr(d, k, getattr(d, k)[0])  # pop out of list
         return x
 
-    def __len__(self):
-        return self.n  # override len(results)
+    def print(self):
+        LOGGER.info(self.__str__())
 
-    def __str__(self):
-        self.print()  # override print(results)
-        return ""
+    def __len__(self):  # override len(results)
+        return self.n
+
+    def __str__(self):  # override print(results)
+        return self._run(pprint=True)  # print results
+
+    def __repr__(self):
+        return f"YOLO {self.__class__} instance\n" + self.__str__()
+
+
+class Proto(nn.Module):
+    # YOLO mask Proto module for segmentation models
+    def __init__(self, c1, c_=256, c2=32):  # ch_in, number of protos, number of masks
+        super().__init__()
+        self.cv1 = Conv(c1, c_, k=3)
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.cv2 = Conv(c_, c_, k=3)
+        self.cv3 = Conv(c_, c2)
+
+    def forward(self, x):
+        return self.cv3(self.cv2(self.upsample(self.cv1(x))))
 
 
 class Classify(nn.Module):
-    # Classification head, i.e. x(b,c1,20,20) to x(b,c2)
+    # YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)
     def __init__(
         self, c1, c2, k=1, s=1, p=None, g=1
     ):  # ch_in, ch_out, kernel, stride, padding, groups

@@ -1,13 +1,4 @@
-# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
-"""
-YOLO-specific modules
-
-Usage:
-    $ python path/to/models/yolo.py --cfg yolov5s.yaml
-"""
-
 import argparse
-import contextlib
 import os
 import platform
 import sys
@@ -15,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[1]  # YOLOv5 root directory
+ROOT = FILE.parents[1]  # YOLO root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 if platform.system() != "Windows":
@@ -23,7 +14,6 @@ if platform.system() != "Windows":
 
 from models.common import *
 from models.experimental import *
-from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
 from utils.torch_utils import (
@@ -35,6 +25,7 @@ from utils.torch_utils import (
     select_device,
     time_sync,
 )
+from utils.tal.anchor_generator import make_anchors, dist2bbox
 
 try:
     import thop  # for FLOPs computation
@@ -42,93 +33,15 @@ except ImportError:
     thop = None
 
 
-class Detect(nn.Module):
-    stride = None  # strides computed during build
-    onnx_dynamic = False  # ONNX export parameter
-    export = False  # export mode
-
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
-        super().__init__()
-        self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
-        self.nl = len(anchors)  # number of detection layers
-        self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [torch.zeros(1)] * self.nl  # init grid
-        self.anchor_grid = [torch.zeros(1)] * self.nl  # init anchor grid
-        self.register_buffer(
-            "anchors", torch.tensor(anchors).float().view(self.nl, -1, 2)
-        )  # shape(nl,na,2)
-        self.m = nn.ModuleList(
-            nn.Conv2d(x, self.no * self.na, 1) for x in ch
-        )  # output conv
-        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
-
-    def forward(self, x):
-        z = []  # inference output
-        for i in range(self.nl):
-            x[i] = self.m[i](x[i])  # conv
-            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = (
-                x[i]
-                .view(bs, self.na, self.no, ny, nx)
-                .permute(0, 1, 3, 4, 2)
-                .contiguous()
-            )
-
-            if not self.training:  # inference
-                if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
-
-                y = x[i].sigmoid()
-                if self.inplace:
-                    y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[
-                        i
-                    ]  # xy
-                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
-                    xy, wh, conf = y.split(
-                        (2, 2, self.nc + 1), 4
-                    )  # y.tensor_split((2, 4, 5), 4)  # torch 1.8.0
-                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
-                    y = torch.cat((xy, wh, conf), 4)
-                z.append(y.view(bs, -1, self.no))
-
-        return (
-            x
-            if self.training
-            else (torch.cat(z, 1),)
-            if self.export
-            else (torch.cat(z, 1), x)
-        )
-
-    def _make_grid(
-        self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, "1.10.0")
-    ):
-        d = self.anchors[i].device
-        t = self.anchors[i].dtype
-        shape = 1, self.na, ny, nx, 2  # grid shape
-        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
-        if torch_1_10:  # torch>=1.10.0 meshgrid workaround for torch>=0.7 compatibility
-            yv, xv = torch.meshgrid(y, x, indexing="ij")
-        else:
-            yv, xv = torch.meshgrid(y, x)
-        grid = (
-            torch.stack((xv, yv), 2).expand(shape) - 0.5
-        )  # add grid offset, i.e. y = 2.0 * x - 0.5
-        anchor_grid = (
-            (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
-        )
-        return grid, anchor_grid
-
-
 class IDetect(nn.Module):
     stride = None  # strides computed during build
-    onnx_dynamic = False  # ONNX export parameter
-    export = False  # export mode
+    export = False  # onnx export
+    end2end = False
+    include_nms = False
+    concat = False
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
-        super().__init__()
+    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
+        super(IDetect, self).__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -142,17 +55,17 @@ class IDetect(nn.Module):
         self.m = nn.ModuleList(
             nn.Conv2d(x, self.no * self.na, 1) for x in ch
         )  # output conv
-        self.inplace = inplace  # use in-place ops (e.g. slice assignment)
 
         self.ia = nn.ModuleList(ImplicitA(x) for x in ch)
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
 
     def forward(self, x):
-        # if not hasattr(self, 'inplace'):
-        #    self.inplace = True
+        # x = x.copy()  # for profiling
         z = []  # inference output
+        self.training |= self.export
         for i in range(self.nl):
-            x[i] = self.im[i](self.m[i](self.ia[i](x[i])))  # conv
+            x[i] = self.m[i](self.ia[i](x[i]))  # conv
+            x[i] = self.im[i](x[i])
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = (
                 x[i]
@@ -162,41 +75,786 @@ class IDetect(nn.Module):
             )
 
             if not self.training:  # inference
-                if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
 
                 y = x[i].sigmoid()
-                # if self.inplace:
-                y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[
+                y[..., 0:2] = (y[..., 0:2] * 2.0 - 0.5 + self.grid[i]) * self.stride[
                     i
                 ]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                # else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
-                #    xy, wh, conf = y.split((2, 2, self.nc + 1), 4)  # y.tensor_split((2, 4, 5), 4)  # torch 1.8.0
-                #    xy = (xy * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                #    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
-                #    y = torch.cat((xy, wh, conf), 4)
                 z.append(y.view(bs, -1, self.no))
 
-        return (
-            x
-            if self.training
-            else (torch.cat(z, 1),)
-            if self.export
-            else (torch.cat(z, 1), x)
-        )
+        return x if self.training else (torch.cat(z, 1), x)
+
+    def fuseforward(self, x):
+        # x = x.copy()  # for profiling
+        z = []  # inference output
+        self.training |= self.export
+        for i in range(self.nl):
+            x[i] = self.m[i](x[i])  # conv
+            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            x[i] = (
+                x[i]
+                .view(bs, self.na, self.no, ny, nx)
+                .permute(0, 1, 3, 4, 2)
+                .contiguous()
+            )
+
+            if not self.training:  # inference
+                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+
+                y = x[i].sigmoid()
+                if not torch.onnx.is_in_onnx_export():
+                    y[..., 0:2] = (
+                        y[..., 0:2] * 2.0 - 0.5 + self.grid[i]
+                    ) * self.stride[
+                        i
+                    ]  # xy
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                else:
+                    xy, wh, conf = y.split(
+                        (2, 2, self.nc + 1), 4
+                    )  # y.tensor_split((2, 4, 5), 4)  # torch 1.8.0
+                    xy = xy * (2.0 * self.stride[i]) + (
+                        self.stride[i] * (self.grid[i] - 0.5)
+                    )  # new xy
+                    wh = wh ** 2 * (4 * self.anchor_grid[i].data)  # new wh
+                    y = torch.cat((xy, wh, conf), 4)
+                z.append(y.view(bs, -1, self.no))
+
+        if self.training:
+            out = x
+        elif self.end2end:
+            out = torch.cat(z, 1)
+        elif self.include_nms:
+            z = self.convert(z)
+            out = (z,)
+        elif self.concat:
+            out = torch.cat(z, 1)
+        else:
+            out = (torch.cat(z, 1), x)
+
+        return out
+
+    def fuse(self):
+        print("IDetect.fuse")
+        # fuse ImplicitA and Convolution
+        for i in range(len(self.m)):
+            c1, c2, _, _ = self.m[i].weight.shape
+            c1_, c2_, _, _ = self.ia[i].implicit.shape
+            self.m[i].bias += torch.matmul(
+                self.m[i].weight.reshape(c1, c2), self.ia[i].implicit.reshape(c2_, c1_)
+            ).squeeze(1)
+
+        # fuse ImplicitM and Convolution
+        for i in range(len(self.m)):
+            c1, c2, _, _ = self.im[i].implicit.shape
+            self.m[i].bias *= self.im[i].implicit.reshape(c2)
+            self.m[i].weight *= self.im[i].implicit.transpose(0, 1)
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
-        if check_version(torch.__version__, "1.10.0"):
-            yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing="ij")
-        else:
-            yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx))
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+    def convert(self, z):
+        z = torch.cat(z, 1)
+        box = z[:, :, :4]
+        conf = z[:, :, 4:5]
+        score = z[:, :, 5:]
+        score *= conf
+        convert_matrix = torch.tensor(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
+            dtype=torch.float32,
+            device=z.device,
+        )
+        box @= convert_matrix
+        return (box, score)
+
+
+class Detect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = max((ch[0] // 4, self.reg_max * 4, 16)), max(
+            (ch[0], min((self.nc * 2, 128)))
+        )  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)
+            )
+            for x in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch
+        )
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        if self.training:
+            return x
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (
+                x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5)
+            )
+            self.shape = shape
+
+        box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox = (
+            dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        y = torch.cat((dbox, cls.sigmoid()), 1)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+
+
+class DDetect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4), max(
+            (ch[0], min((self.nc * 2, 128)))
+        )  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3),
+                Conv(c2, c2, 3, g=4),
+                nn.Conv2d(c2, 4 * self.reg_max, 1, groups=4),
+            )
+            for x in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch
+        )
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        if self.training:
+            return x
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (
+                x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5)
+            )
+            self.shape = shape
+
+        box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox = (
+            dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        y = torch.cat((dbox, cls.sigmoid()), 1)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+
+
+class DualDetect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch) // 2  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = max((ch[0] // 4, self.reg_max * 4, 16)), max(
+            (ch[0], min((self.nc * 2, 128)))
+        )  # channels
+        c4, c5 = max((ch[self.nl] // 4, self.reg_max * 4, 16)), max(
+            (ch[self.nl], min((self.nc * 2, 128)))
+        )  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)
+            )
+            for x in ch[: self.nl]
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch[: self.nl]
+        )
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, 4 * self.reg_max, 1)
+            )
+            for x in ch[self.nl :]
+        )
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nc, 1))
+            for x in ch[self.nl :]
+        )
+        self.dfl = DFL(self.reg_max)
+        self.dfl2 = DFL(self.reg_max)
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        d1 = []
+        d2 = []
+        for i in range(self.nl):
+            d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
+            d2.append(
+                torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1)
+            )
+        if self.training:
+            return [d1, d2]
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (
+                d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5)
+            )
+            self.shape = shape
+
+        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox = (
+            dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox2 = (
+            dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]
+        return y if self.export else (y, [d1, d2])
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv4, m.cv5, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+
+
+class DualDDetect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch) // 2  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4), max(
+            (ch[0], min((self.nc * 2, 128)))
+        )  # channels
+        c4, c5 = make_divisible(max((ch[self.nl] // 4, self.reg_max * 4, 16)), 4), max(
+            (ch[self.nl], min((self.nc * 2, 128)))
+        )  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3),
+                Conv(c2, c2, 3, g=4),
+                nn.Conv2d(c2, 4 * self.reg_max, 1, groups=4),
+            )
+            for x in ch[: self.nl]
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch[: self.nl]
+        )
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c4, 3),
+                Conv(c4, c4, 3, g=4),
+                nn.Conv2d(c4, 4 * self.reg_max, 1, groups=4),
+            )
+            for x in ch[self.nl :]
+        )
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nc, 1))
+            for x in ch[self.nl :]
+        )
+        self.dfl = DFL(self.reg_max)
+        self.dfl2 = DFL(self.reg_max)
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        d1 = []
+        d2 = []
+        for i in range(self.nl):
+            d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
+            d2.append(
+                torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1)
+            )
+        if self.training:
+            return [d1, d2]
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (
+                d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5)
+            )
+            self.shape = shape
+
+        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox = (
+            dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox2 = (
+            dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]
+        return y if self.export else (y, [d1, d2])
+        # y = torch.cat((dbox2, cls2.sigmoid()), 1)
+        # return y if self.export else (y, d2)
+        # y1 = torch.cat((dbox, cls.sigmoid()), 1)
+        # y2 = torch.cat((dbox2, cls2.sigmoid()), 1)
+        # return [y1, y2] if self.export else [(y1, d1), (y2, d2)]
+        # return [y1, y2] if self.export else [(y1, y2), (d1, d2)]
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv4, m.cv5, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+
+
+class TripleDetect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch) // 3  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = max((ch[0] // 4, self.reg_max * 4, 16)), max(
+            (ch[0], min((self.nc * 2, 128)))
+        )  # channels
+        c4, c5 = max((ch[self.nl] // 4, self.reg_max * 4, 16)), max(
+            (ch[self.nl], min((self.nc * 2, 128)))
+        )  # channels
+        c6, c7 = max((ch[self.nl * 2] // 4, self.reg_max * 4, 16)), max(
+            (ch[self.nl * 2], min((self.nc * 2, 128)))
+        )  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)
+            )
+            for x in ch[: self.nl]
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch[: self.nl]
+        )
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, 4 * self.reg_max, 1)
+            )
+            for x in ch[self.nl : self.nl * 2]
+        )
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nc, 1))
+            for x in ch[self.nl : self.nl * 2]
+        )
+        self.cv6 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c6, 3), Conv(c6, c6, 3), nn.Conv2d(c6, 4 * self.reg_max, 1)
+            )
+            for x in ch[self.nl * 2 : self.nl * 3]
+        )
+        self.cv7 = nn.ModuleList(
+            nn.Sequential(Conv(x, c7, 3), Conv(c7, c7, 3), nn.Conv2d(c7, self.nc, 1))
+            for x in ch[self.nl * 2 : self.nl * 3]
+        )
+        self.dfl = DFL(self.reg_max)
+        self.dfl2 = DFL(self.reg_max)
+        self.dfl3 = DFL(self.reg_max)
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        d1 = []
+        d2 = []
+        d3 = []
+        for i in range(self.nl):
+            d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
+            d2.append(
+                torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1)
+            )
+            d3.append(
+                torch.cat(
+                    (self.cv6[i](x[self.nl * 2 + i]), self.cv7[i](x[self.nl * 2 + i])),
+                    1,
+                )
+            )
+        if self.training:
+            return [d1, d2, d3]
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (
+                d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5)
+            )
+            self.shape = shape
+
+        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox = (
+            dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox2 = (
+            dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        box3, cls3 = torch.cat([di.view(shape[0], self.no, -1) for di in d3], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox3 = (
+            dist2bbox(self.dfl3(box3), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        y = [
+            torch.cat((dbox, cls.sigmoid()), 1),
+            torch.cat((dbox2, cls2.sigmoid()), 1),
+            torch.cat((dbox3, cls3.sigmoid()), 1),
+        ]
+        return y if self.export else (y, [d1, d2, d3])
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv4, m.cv5, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv6, m.cv7, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+
+
+class TripleDDetect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch) // 3  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4), max(
+            (ch[0], min((self.nc * 2, 128)))
+        )  # channels
+        c4, c5 = make_divisible(max((ch[self.nl] // 4, self.reg_max * 4, 16)), 4), max(
+            (ch[self.nl], min((self.nc * 2, 128)))
+        )  # channels
+        c6, c7 = make_divisible(
+            max((ch[self.nl * 2] // 4, self.reg_max * 4, 16)), 4
+        ), max(
+            (ch[self.nl * 2], min((self.nc * 2, 128)))
+        )  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c2, 3),
+                Conv(c2, c2, 3, g=4),
+                nn.Conv2d(c2, 4 * self.reg_max, 1, groups=4),
+            )
+            for x in ch[: self.nl]
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch[: self.nl]
+        )
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c4, 3),
+                Conv(c4, c4, 3, g=4),
+                nn.Conv2d(c4, 4 * self.reg_max, 1, groups=4),
+            )
+            for x in ch[self.nl : self.nl * 2]
+        )
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nc, 1))
+            for x in ch[self.nl : self.nl * 2]
+        )
+        self.cv6 = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c6, 3),
+                Conv(c6, c6, 3, g=4),
+                nn.Conv2d(c6, 4 * self.reg_max, 1, groups=4),
+            )
+            for x in ch[self.nl * 2 : self.nl * 3]
+        )
+        self.cv7 = nn.ModuleList(
+            nn.Sequential(Conv(x, c7, 3), Conv(c7, c7, 3), nn.Conv2d(c7, self.nc, 1))
+            for x in ch[self.nl * 2 : self.nl * 3]
+        )
+        self.dfl = DFL(self.reg_max)
+        self.dfl2 = DFL(self.reg_max)
+        self.dfl3 = DFL(self.reg_max)
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        d1 = []
+        d2 = []
+        d3 = []
+        for i in range(self.nl):
+            d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
+            d2.append(
+                torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1)
+            )
+            d3.append(
+                torch.cat(
+                    (self.cv6[i](x[self.nl * 2 + i]), self.cv7[i](x[self.nl * 2 + i])),
+                    1,
+                )
+            )
+        if self.training:
+            return [d1, d2, d3]
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (
+                d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5)
+            )
+            self.shape = shape
+
+        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox = (
+            dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox2 = (
+            dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        box3, cls3 = torch.cat([di.view(shape[0], self.no, -1) for di in d3], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        dbox3 = (
+            dist2bbox(self.dfl3(box3), self.anchors.unsqueeze(0), xywh=True, dim=1)
+            * self.strides
+        )
+        # y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1), torch.cat((dbox3, cls3.sigmoid()), 1)]
+        # return y if self.export else (y, [d1, d2, d3])
+        y = torch.cat((dbox3, cls3.sigmoid()), 1)
+        return y if self.export else (y, d3)
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv4, m.cv5, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv6, m.cv7, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(
+                5 / m.nc / (640 / s) ** 2
+            )  # cls (5 objects and 80 classes per 640 image)
+
+
+class Segment(Detect):
+    # YOLO Segment head for segmentation models
+    def __init__(self, nc=80, nm=32, npr=256, ch=(), inplace=True):
+        super().__init__(nc, ch, inplace)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+        self.detect = Detect.forward
+
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1))
+            for x in ch
+        )
+
+    def forward(self, x):
+        p = self.proto(x[0])
+        bs = p.shape[0]
+
+        mc = torch.cat(
+            [self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
+        )  # mask coefficients
+        x = self.detect(self, x)
+        if self.training:
+            return x, mc, p
+        return (
+            (torch.cat([x, mc], 1), p)
+            if self.export
+            else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+        )
+
+
+class Panoptic(Detect):
+    # YOLO Panoptic head for panoptic segmentation models
+    def __init__(self, nc=80, sem_nc=93, nm=32, npr=256, ch=(), inplace=True):
+        super().__init__(nc, ch, inplace)
+        self.sem_nc = sem_nc
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+        self.uconv = UConv(ch[0], ch[0] // 4, self.sem_nc + self.nc)
+        self.detect = Detect.forward
+
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1))
+            for x in ch
+        )
+
+    def forward(self, x):
+        p = self.proto(x[0])
+        s = self.uconv(x[0])
+        bs = p.shape[0]
+
+        mc = torch.cat(
+            [self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
+        )  # mask coefficients
+        x = self.detect(self, x)
+        if self.training:
+            return x, mc, p, s
+        return (
+            (torch.cat([x, mc], 1), p, s)
+            if self.export
+            else (torch.cat([x[0], mc], 1), (x[1], mc, p, s))
+        )
 
 
 class BaseModel(nn.Module):
-    # YOLOv5 base model
+    # YOLO base model
     def forward(self, x, profile=False, visualize=False):
         return self._forward_once(
             x, profile, visualize
@@ -237,8 +895,11 @@ class BaseModel(nn.Module):
             LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
-        # LOGGER.info('Fusing layers... ')
+        LOGGER.info("Fusing layers... ")
         for m in self.model.modules():
+            if isinstance(m, (RepConvN)) and hasattr(m, "fuse_convs"):
+                m.fuse_convs()
+                m.forward = m.forward_fuse  # update forward
             if isinstance(m, (Conv, DWConv)) and hasattr(m, "bn"):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, "bn")  # remove batchnorm
@@ -253,18 +914,29 @@ class BaseModel(nn.Module):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
+        if isinstance(
+            m,
+            (
+                Detect,
+                DualDetect,
+                TripleDetect,
+                DDetect,
+                DualDDetect,
+                TripleDDetect,
+                Segment,
+            ),
+        ):
             m.stride = fn(m.stride)
-            m.grid = list(map(fn, m.grid))
-            if isinstance(m.anchor_grid, list):
-                m.anchor_grid = list(map(fn, m.anchor_grid))
+            m.anchors = fn(m.anchors)
+            m.strides = fn(m.strides)
+            # m.grid = list(map(fn, m.grid))
         return self
 
 
 class DetectionModel(BaseModel):
-    # YOLOv5 detection model
+    # YOLO detection model
     def __init__(
-        self, cfg="yolov5s.yaml", ch=3, nc=None, anchors=None
+        self, cfg="yolo.yaml", ch=3, nc=None, anchors=None
     ):  # model, input channels, number of classes
         super().__init__()
         if isinstance(cfg, dict):
@@ -292,16 +964,33 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, IDetect)):
+        if isinstance(m, (Detect, DDetect, Segment)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
+            forward = (
+                lambda x: self.forward(x)[0]
+                if isinstance(m, (Segment))
+                else self.forward(x)
+            )
             m.stride = torch.tensor(
-                [s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))]
+                [s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))]
             )  # forward
-            check_anchor_order(m)  # must be in pixel-space (not grid-space)
-            m.anchors /= m.stride.view(-1, 1, 1)
+            # check_anchor_order(m)
+            # m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
-            self._initialize_biases()  # only run once
+            m.bias_init()  # only run once
+        if isinstance(m, (DualDetect, TripleDetect, DualDDetect, TripleDDetect)):
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+            # forward = lambda x: self.forward(x)[0][0] if isinstance(m, (DualSegment)) else self.forward(x)[0]
+            forward = lambda x: self.forward(x)[0]
+            m.stride = torch.tensor(
+                [s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))]
+            )  # forward
+            # check_anchor_order(m)
+            # m.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            m.bias_init()  # only run once
 
         # Init weights, biases
         initialize_weights(self)
@@ -351,38 +1040,28 @@ class DetectionModel(BaseModel):
         return p
 
     def _clip_augmented(self, y):
-        # Clip YOLOv5 augmented inference tails
+        # Clip YOLO augmented inference tails
         nl = self.model[-1].nl  # number of detection layers (P3-P5)
-        g = sum(4**x for x in range(nl))  # grid points
+        g = sum(4 ** x for x in range(nl))  # grid points
         e = 1  # exclude layer count
-        i = (y[0].shape[1] // g) * sum(4**x for x in range(e))  # indices
+        i = (y[0].shape[1] // g) * sum(4 ** x for x in range(e))  # indices
         y[0] = y[0][:, :-i]  # large
         i = (y[-1].shape[1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
         y[-1] = y[-1][:, i:]  # small
         return y
 
-    def _initialize_biases(
-        self, cf=None
-    ):  # initialize biases into Detect(), cf is class frequency
-        # https://arxiv.org/abs/1708.02002 section 3.3
-        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-1]  # Detect() module
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1).detach()  # conv.bias(255) to (3,85)
-            b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b[:, 5:] += (
-                math.log(0.6 / (m.nc - 0.999999))
-                if cf is None
-                else torch.log(cf / cf.sum())
-            )  # cls
-            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+Model = DetectionModel  # retain YOLO 'Model' class for backwards compatibility
 
 
-Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
+class SegmentationModel(DetectionModel):
+    # YOLO segmentation model
+    def __init__(self, cfg="yolo-seg.yaml", ch=3, nc=None, anchors=None):
+        super().__init__(cfg, ch, nc, anchors)
 
 
 class ClassificationModel(BaseModel):
-    # YOLOv5 classification model
+    # YOLO classification model
     def __init__(
         self, cfg=None, model=None, nc=1000, cutoff=10
     ):  # yaml, model, number of classes, cutoff index
@@ -392,7 +1071,7 @@ class ClassificationModel(BaseModel):
         ) if model is not None else self._from_yaml(cfg)
 
     def _from_detection_model(self, model, nc=1000, cutoff=10):
-        # Create a YOLOv5 classification model from a YOLOv5 detection model
+        # Create a YOLO classification model from a YOLO detection model
         if isinstance(model, DetectMultiBackend):
             model = model.model  # unwrap DetectMultiBackend
         model.model = model.model[:cutoff]  # backbone
@@ -409,20 +1088,27 @@ class ClassificationModel(BaseModel):
         self.nc = nc
 
     def _from_yaml(self, cfg):
-        # Create a YOLOv5 classification model from a *.yaml file
+        # Create a YOLO classification model from a *.yaml file
         self.model = None
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
+    # Parse a YOLO model.yaml dictionary
     LOGGER.info(
         f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}"
     )
-    anchors, nc, gd, gw = (
+    anchors, nc, gd, gw, act = (
         d["anchors"],
         d["nc"],
         d["depth_multiple"],
         d["width_multiple"],
+        d.get("activation"),
     )
+    if act:
+        Conv.default_act = eval(
+            act
+        )  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
+        LOGGER.info(f"{colorstr('activation:')} {act}")  # print
     na = (
         (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors
     )  # number of anchors
@@ -438,43 +1124,59 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in (
+        if m in {
             Conv,
-            GhostConv,
+            AConv,
+            ConvTranspose,
             Bottleneck,
-            GhostBottleneck,
             SPP,
             SPPF,
             DWConv,
-            MixConv2d,
-            Focus,
-            CrossConv,
             BottleneckCSP,
-            C3,
-            C3TR,
-            C3SPP,
-            C3Ghost,
             nn.ConvTranspose2d,
             DWConvTranspose2d,
-            C3x,
             SPPCSPC,
-        ):
+            ADown,
+            RepNCSPELAN4,
+            SPPELAN,
+        }:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3TR, C3Ghost, C3x, SPPCSPC]:
+            if m in {BottleneckCSP, SPPCSPC}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, IDetect}:
+        elif m is Shortcut:
+            c2 = ch[f[0]]
+        elif m is ReOrg:
+            c2 = ch[f] * 4
+        elif m is CBLinear:
+            c2 = args[0]
+            c1 = ch[f]
+            args = [c1, c2, *args[1:]]
+        elif m is CBFuse:
+            c2 = ch[f[-1]]
+        # TODO: channel, gw, gd
+        elif m in {
+            Detect,
+            DualDetect,
+            TripleDetect,
+            DDetect,
+            DualDDetect,
+            TripleDDetect,
+            Segment,
+        }:
             args.append([ch[x] for x in f])
-            if isinstance(args[1], int):  # number of anchors
-                args[1] = [list(range(args[1] * 2))] * len(f)
+            # if isinstance(args[1], int):  # number of anchors
+            #     args[1] = [list(range(args[1] * 2))] * len(f)
+            if m in {Segment}:
+                args[2] = make_divisible(args[2] * gw, 8)
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
@@ -508,7 +1210,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=str, default="yolov5s.yaml", help="model.yaml")
+    parser.add_argument("--cfg", type=str, default="yolo.yaml", help="model.yaml")
     parser.add_argument(
         "--batch-size", type=int, default=1, help="total batch size for all GPUs"
     )
@@ -528,6 +1230,7 @@ if __name__ == "__main__":
     # Create model
     im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
     model = Model(opt.cfg).to(device)
+    model.eval()
 
     # Options
     if opt.line_profile:  # profile layer by layer
