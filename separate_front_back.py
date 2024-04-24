@@ -20,7 +20,7 @@ def make_request(image_path: str):
         _, im_arr = cv2.imencode(".jpeg", select_image)
         img_bytes = im_arr.tobytes()
         im_b64 = base64.b64encode(img_bytes)
-        myobj = {"data":f"{im_b64.decode('ascii')}", "detect_type":"left2right"}
+        myobj = {"card_limit":1,"data":f"{im_b64.decode('ascii')}", "detect_type":"left2right"}
         resp = requests.post(
                 ADDRESS,
                 json=myobj
@@ -32,14 +32,16 @@ def make_request(image_path: str):
         # print(len(_resp['detections'])) 
         if len(_resp['detections']) != 0:
             shutil.move(image_path, os.path.join(FRONT_DIR, fname))
+        else:
+            shutil.move(image_path, os.path.join(BACK_DIR, fname))
     except Exception as e:
-        print(e)
+        # print(e)
         pass
 
 
 if __name__ == "__main__":
 
-    ADDRESS = "http://192.168.89.243:5005/cardDetectPost"
+    ADDRESS = "http://localhost:5005/cardDetectPost"
     args = argparse.ArgumentParser()
     args.add_argument("--folder", type=str, help="processing folder")
     opt = args.parse_args()
