@@ -5,9 +5,9 @@ from autolabel import AutoLabel
 from rich import print
 
 
-def main(source: str = "test"):
+def main(source: str = "test", use_ultralytics: bool = False):
     label = AutoLabel(source)
-    label.Label()
+    label.Label(use_ultralytics)
 
 
 if __name__ == "__main__":

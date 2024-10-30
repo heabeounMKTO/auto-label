@@ -11,6 +11,7 @@ import tqdm
 from rich import print
 from rich.console import Console
 from rich.table import Table
+from ultralytics import YOLO
 
 # read global config file
 config = configparser.ConfigParser()
@@ -51,21 +52,34 @@ class AutoLabel:
                     imagePaths.append(fullimagepath)
             return imagePaths
 
-    def Label(self):
+    def Label(self, use_ultralytics: bool = False):
         images = self.findAllImageInFolder()
-        for image in tqdm.tqdm(images):
-            detectLabels = imageDetect(
-                image, CUDA_DEVICE, self.loadmodel, CONFIDENCE_THRESH
-            )
-            result = detectLabels.detect()
-            json_obj = json.dumps(result, indent=2)
-            fileName = os.path.splitext(os.path.basename(image))[0] + ".json"
-            jsonFileExportName = os.path.join(self.processingFolder, fileName)
-            # export json with same name as image file name
-            with open(jsonFileExportName, "w") as json_output:
-                json_output.write(json_obj)
-        print("Labeling Done!\n")
-        table = Table("Images Labeled")
-        table.add_row(f"{self.labeledimg}")
-        console = Console()
-        console.print(table)
+        if not use_ultralytics:
+            for image in tqdm.tqdm(images):
+                detectLabels = imageDetect(
+                    image, CUDA_DEVICE, self.loadmodel, CONFIDENCE_THRESH
+                )
+                result = detectLabels.detect()
+                json_obj = json.dumps(result, indent=2)
+                fileName = os.path.splitext(os.path.basename(image))[0] + ".json"
+                jsonFileExportName = os.path.join(self.processingFolder, fileName)
+                # export json with same name as image file name
+                with open(jsonFileExportName, "w") as json_output:
+                    json_output.write(json_obj)
+            print("Labeling Done!\n")
+            table = Table("Images Labeled")
+            table.add_row(f"{self.labeledimg}")
+            console = Console()
+            console.print(table)
+        else:
+            load_model = YOLO(MODEL_PATH, verbose=False)
+            model_classes = load_model.names
+            for image_pth in tqdm.tqdm(images):
+                img = cv2.imread(image_pth)
+                results = load_model(img, show=False, verbose=False, conf=CONFIDENCE_THRESH)
+                for result in results:
+                    classes = result.boxes.cls.tolist()
+                    xyxys = result.boxes.xyxy.tolist()
+                    print(xyxys)
+
+
