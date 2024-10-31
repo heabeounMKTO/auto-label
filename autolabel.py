@@ -23,6 +23,14 @@ CONFIDENCE_THRESH = float(config["INFERENCE_CONFIG"]["CONFIDENCE"])
 ext = [".jpeg", ".jpg", ".png"]
 
 
+
+def _convertImg2b64(imgpath):
+    with open(imgpath, "rb") as img_file:
+        imgstring = base64.b64encode(img_file.read())
+    return imgstring
+
+
+
 class AutoLabel:
     def __init__(self, processingFolder, confidence=0.9, iou=0.7):
         self.processingFolder = processingFolder
@@ -77,9 +85,37 @@ class AutoLabel:
             for image_pth in tqdm.tqdm(images):
                 img = cv2.imread(image_pth)
                 results = load_model(img, show=False, verbose=False, conf=CONFIDENCE_THRESH)
+                all_shapes = []
                 for result in results:
                     classes = result.boxes.cls.tolist()
+                    confidence = result.boxes.conf.tolist()
                     xyxys = result.boxes.xyxy.tolist()
-                    print(xyxys)
-
+                    for idx, xyxy in enumerate(xyxys):
+                            class_name = model_classes[classes[idx]]
+                            _confidence = confidence[idx]
+                            x1, y1, x2, y2 = [int(x) for x in xyxy] 
+                            all_pts = [[x1, y1], [x2, y2]]
+                            points = {
+                                "label": class_name,
+                                "points": all_pts,
+                                "group_id": f"{_confidence}",
+                                "shape_type": "rectangle",
+                                "flags": {},
+                            }
+                            all_shapes.append(points)
+                labelme_annotation = {
+                            "version": "5.1.1",
+                            "flags": {},
+                            "shapes": all_shapes,
+                            "imagePath": os.path.basename(image_pth),
+                            "imageData": _convertImg2b64(image_pth).decode("utf-8"),
+                            "imageHeight": img.shape[0],
+                            "imageWidth": img.shape[1],
+                        }
+                fileName = os.path.splitext(os.path.basename(image_pth))[0] + ".json"
+                jsonFileExportName = os.path.join(self.processingFolder, fileName)
+                # export json with same name as image file name
+                with open(jsonFileExportName, "w") as json_output:
+                    json_output.write(json.dumps(labelme_annotation, indent=2))
+                
 
